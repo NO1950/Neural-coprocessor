@@ -373,7 +373,7 @@ static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, R271
 // launch, at the site that already resizes and commits the chain
 // (present_resize): no file write, no new lock use, no next-launch marker.
 static int   g_dcomp_fit = 0;           // DcompFit: 0 off, 1 on, 2 auto; read once when the chain is created
-namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
+namespace { bool ini_read_flag(const char *key); bool ini_read_flag_on(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
 // R278: how many velocity candidates the census found eligible (probe.cpp), handed
 // over by dllmain each frame - this file names no probe type.
 std::atomic<unsigned> g_mvec_elig_n{0};
@@ -461,7 +461,9 @@ static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
 static void *g_dcomp_d3d11  = nullptr;
 // V53: whether the visual is currently the target's root. Starts FALSE - the
 // tree is built at chain creation but deliberately left unrooted.
-static bool  g_dcomp_rooted = false;
+// [OURS] atomic: written on the bridge thread, read from the game's overlay
+// callback by dcomp_visual_rooted().
+static std::atomic<bool> g_dcomp_rooted{false};
 
 // The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
 // has been confirmed to be the GAME's by LUID. Authoritative: it is the window
@@ -581,6 +583,56 @@ bool dcomp_peek_toggle()
     if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
         return true;   // not composing: nothing is covering the overlay anyway
     return dcomp_set_rooted(!g_dcomp_rooted, "peek");
+}
+
+// ===========================================================================
+// [OURS] PanelOverPicture. NOT UPSTREAM - added 2026-10-11.
+//
+// Latched on the first call, like dcomp_overlay_mode() and for the same
+// reason: it is read from an input event and must give ONE answer per run -
+// a key that flipped mid-run would leave the panel and the visual disagreeing
+// about which of them is on top.
+//
+// ABSENT IS OFF, so that nothing changes for anyone who does not ask for it:
+// the key is an opt-in, and 0 (or no key at all) is exactly the author's
+// behaviour - the visual is unrooted and the picture returns to native while a
+// panel is up. Our own machines run with PanelOverPicture=1 written into
+// mgpu.ini, because this patch is why this build was made.
+// ===========================================================================
+bool panel_over_picture()
+{
+    static std::atomic<int> latched{-1};
+    int v = latched.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = ini_read_flag("PanelOverPicture") ? 1 : 0;
+        latched.store(v, std::memory_order_relaxed);
+        char l[300];
+        snprintf(l, sizeof l,
+                 "[MGPU][OURS][P1] PanelOverPicture=%d (%s). 1: an open panel is drawn by the GPU 1 "
+                 "runtime, ON TOP of the live neural frame, and the composed visual is never unrooted. "
+                 "0: the author's behaviour - the visual is unrooted and the picture returns to native "
+                 "while a panel is up.",
+                 v, (v != 0) ? "ON - written as 1" : "OFF - absent or 0");
+        mgpu::diag::info(l);
+    }
+    return v == 1;
+}
+
+// [OURS] Is the visual on screen? Read from the overlay callback, which runs on
+// the GAME's thread, while this is written on the bridge thread - so it is an
+// atomic rather than the plain bool it used to be. Every use of it is a
+// boolean test, which is why the type change costs nothing.
+bool dcomp_visual_rooted()
+{
+    return g_dcomp_rooted.load(std::memory_order_relaxed);
+}
+
+// [OURS] The window the visual is rooted on. Read by dllmain's live-panel input
+// mapping; NULL before the game's swapchain has been identified.
+void *dcomp_game_hwnd()
+{
+    return (void *)g_game_hwnd;
 }
 
 
@@ -10456,6 +10508,19 @@ namespace
         return (k != nullptr) && (*k == '1');
     }
 
+    // [OURS] Like ini_read_flag, but ABSENT IS ON and the file itself is not
+    // allowed to answer "on" - only "off". PanelOverPicture is the one key this
+    // build adds, and its default is the reason the build exists.
+    bool ini_read_flag_on(const char *key)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return true;   // no ini at all: still on
+        const char *k = ini_find(buf, key);
+        if (k == nullptr) return true;                  // absent: on
+        if (k[0] == '\0') return true;                  // present but empty: on
+        return k[0] == '1';
+    }
+
     // R212. Pass2Region=<percent of the frame's AREA, 10-99>. Absent, 100 or
     // out of range: 0, off.
     unsigned ini_read_pass2_region()
@@ -12781,6 +12846,71 @@ namespace
             return false;
         }
 
+        // ===================================================================
+        // [OURS] PRELOAD WHAT A PROXY-STYLE SNIPPET FORWARDS TO. NOT UPSTREAM.
+        //
+        // THE DEFECT, and it cost this rig the whole neural stage on 0.3.1.
+        // The Cost-Scaler proxy is what sits at <game>\bin\mgpu\nvngx_dlssnr.dll
+        // here. It intercepts four entry points and carries the REST of the NGX
+        // surface - 55 names, PopulateParameters_Impl among them - as LINKER
+        // FORWARDERS to nvngx_dlssnr_real.dll beside it.
+        //
+        // A forwarder is resolved by the loader against the modules ALREADY in
+        // the process (matched by base name) or the standard search order. It is
+        // NEVER resolved against the proxy's own folder. So before anything has
+        // called Init on the proxy, the real module is not in the process and
+        // every forwarded name answers missing - including the one line below
+        // that resolves STRICTLY from the snippet:
+        //
+        //   ngx_resolve_strict(mods.snippet, "...NVSDK_NGX_D3D12_PopulateParameters_Impl")
+        //
+        // That makes it a chicken and egg: the proxy loads the real module when
+        // its Init runs, and the Init never runs because the resolve that needs
+        // the real module fails first. The stream then reports the single line
+        // "an NGX entry point did not resolve - transport-only" and the neural
+        // layer never appears at all.
+        //
+        // 0.3.0 did not ask for that name, which is exactly why FC6 sat on
+        // 0.3.0 while KCD2 ran 0.3.1 - the version split on this rig was this
+        // one resolve, and nothing else.
+        //
+        // MEASURED, not reasoned: build\_dl\ngxprobe does these same two
+        // GetProcAddress calls against these same two modules outside the game.
+        // Without the preload PopulateParameters_Impl is null from BOTH modules;
+        // with it, all six of P4.1's entry points resolve.
+        //
+        // The load is a no-op when the real module is already in the process,
+        // and skips silently when the snippet is the real module itself - which
+        // is the KCD2 arrangement and every non-proxy install.
+        // ===================================================================
+        {
+            wchar_t sp[MAX_PATH] = {};
+            if (GetModuleFileNameW(mods.snippet, sp, MAX_PATH) != 0)
+            {
+                wchar_t *slash = wcsrchr(sp, L'\\');
+                if (slash != nullptr)
+                {
+                    *(slash + 1) = L'\0';
+                    wchar_t real[MAX_PATH] = {};
+                    swprintf_s(real, L"%lsnvngx_dlssnr_real.dll", sp);
+                    if (GetFileAttributesW(real) != INVALID_FILE_ATTRIBUTES &&
+                        GetModuleHandleW(L"nvngx_dlssnr_real.dll") == nullptr)
+                    {
+                        HMODULE h = LoadLibraryW(real);
+                        char l[MAX_PATH + 300];
+                        snprintf(l, sizeof l,
+                                 "[MGPU][OURS][P4.1] the private snippet is a PROXY: preloading its "
+                                 "forwarder target %ls -> %s. The strict resolve of "
+                                 "PopulateParameters_Impl below is satisfied by that module's export "
+                                 "through the proxy's forwarder, and a forwarder does not answer "
+                                 "until its target is in the process.",
+                                 real, (h != nullptr) ? "loaded" : "FAILED - the resolve below WILL fail");
+                        if (h != nullptr) mgpu::diag::info(l); else mgpu::diag::error(l);
+                    }
+                }
+            }
+        }
+
         char w[9][160] = {};
         ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
         char w_iext41[160];
@@ -12801,6 +12931,23 @@ namespace
         if (p_init == nullptr || p_caps == nullptr || p_iext == nullptr || p_pop == nullptr ||
             p_cre == nullptr || s.nr_eval == nullptr)
         {
+            // [OURS] SAY WHICH ONE. Upstream reports that an entry point is
+            // missing and names none of them, so the next run cannot narrow
+            // anything - and on this rig that cost a launch, twice, before the
+            // name was found outside the game (build\_dl\ngxprobe). The w[]
+            // strings are already built by the resolvers for exactly this:
+            // "core+snippet(used:x)" for the two-module lookups and "yes"/"no"
+            // for the strict snippet ones.
+            char dl[760];
+            snprintf(dl, sizeof dl,
+                     "[MGPU][OURS][P4.1] RESOLVE DETAIL - Init[%s] Caps[%s] Init_Ext[%s] "
+                     "PopulateParameters[%s] CreateFeature[%s] EvaluateFeature[%s] | release[%s] "
+                     "shutdown[%s] destroy[%s] | Init_Ext(core)[%s]. A name reading 'missing' or "
+                     "'no' is the one that failed. core=- means the NGX core was not reachable; "
+                     "snippet=- means the private NR module was not - and if the snippet is a "
+                     "proxy, its FORWARDED names only answer once its target module is loaded.",
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w_iext41);
+            mgpu::diag::error(dl);
             mgpu::diag::error("[MGPU][P4.1] an NGX entry point did not resolve - transport-only");
             return false;
         }
