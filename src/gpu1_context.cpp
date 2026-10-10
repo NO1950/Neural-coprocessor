@@ -373,7 +373,7 @@ static void *g_dcomp_scale = nullptr;   // IDCompositionScaleTransform, R271
 // launch, at the site that already resizes and commits the chain
 // (present_resize): no file write, no new lock use, no next-launch marker.
 static int   g_dcomp_fit = 0;           // DcompFit: 0 off, 1 on, 2 auto; read once when the chain is created
-namespace { bool ini_read_flag(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
+namespace { bool ini_read_flag(const char *key); bool ini_read_flag_on(const char *key); int ini_read_dcomp_fit(); bool ini_has_key(const char *key); }   // unnamed-namespace readers, defined below
 // R278: how many velocity candidates the census found eligible (probe.cpp), handed
 // over by dllmain each frame - this file names no probe type.
 std::atomic<unsigned> g_mvec_elig_n{0};
@@ -461,7 +461,9 @@ static void dcomp_fit_apply(unsigned src_w, unsigned src_h, const char *where)
 static void *g_dcomp_d3d11  = nullptr;
 // V53: whether the visual is currently the target's root. Starts FALSE - the
 // tree is built at chain creation but deliberately left unrooted.
-static bool  g_dcomp_rooted = false;
+// [OURS] atomic: written on the bridge thread, read from the game's overlay
+// callback by dcomp_visual_rooted().
+static std::atomic<bool> g_dcomp_rooted{false};
 
 // The game's HWND, pushed from dllmain's on_init_swapchain once the swapchain
 // has been confirmed to be the GAME's by LUID. Authoritative: it is the window
@@ -581,6 +583,56 @@ bool dcomp_peek_toggle()
     if (g_dcomp_target == nullptr || g_dcomp_visual == nullptr || g_dcomp_device == nullptr)
         return true;   // not composing: nothing is covering the overlay anyway
     return dcomp_set_rooted(!g_dcomp_rooted, "peek");
+}
+
+// ===========================================================================
+// [OURS] PanelOverPicture. NOT UPSTREAM - added 2026-10-11.
+//
+// Latched on the first call, like dcomp_overlay_mode() and for the same
+// reason: it is read from an input event and must give ONE answer per run -
+// a key that flipped mid-run would leave the panel and the visual disagreeing
+// about which of them is on top.
+//
+// ABSENT IS OFF, so that nothing changes for anyone who does not ask for it:
+// the key is an opt-in, and 0 (or no key at all) is exactly the author's
+// behaviour - the visual is unrooted and the picture returns to native while a
+// panel is up. Our own machines run with PanelOverPicture=1 written into
+// mgpu.ini, because this patch is why this build was made.
+// ===========================================================================
+bool panel_over_picture()
+{
+    static std::atomic<int> latched{-1};
+    int v = latched.load(std::memory_order_relaxed);
+    if (v < 0)
+    {
+        v = ini_read_flag("PanelOverPicture") ? 1 : 0;
+        latched.store(v, std::memory_order_relaxed);
+        char l[300];
+        snprintf(l, sizeof l,
+                 "[MGPU][OURS][P1] PanelOverPicture=%d (%s). 1: an open panel is drawn by the GPU 1 "
+                 "runtime, ON TOP of the live neural frame, and the composed visual is never unrooted. "
+                 "0: the author's behaviour - the visual is unrooted and the picture returns to native "
+                 "while a panel is up.",
+                 v, (v != 0) ? "ON - written as 1" : "OFF - absent or 0");
+        mgpu::diag::info(l);
+    }
+    return v == 1;
+}
+
+// [OURS] Is the visual on screen? Read from the overlay callback, which runs on
+// the GAME's thread, while this is written on the bridge thread - so it is an
+// atomic rather than the plain bool it used to be. Every use of it is a
+// boolean test, which is why the type change costs nothing.
+bool dcomp_visual_rooted()
+{
+    return g_dcomp_rooted.load(std::memory_order_relaxed);
+}
+
+// [OURS] The window the visual is rooted on. Read by dllmain's live-panel input
+// mapping; NULL before the game's swapchain has been identified.
+void *dcomp_game_hwnd()
+{
+    return (void *)g_game_hwnd;
 }
 
 
@@ -10454,6 +10506,19 @@ namespace
         if (!ini_slurp(buf, sizeof buf)) return false;
         const char *k = ini_find(buf, key);
         return (k != nullptr) && (*k == '1');
+    }
+
+    // [OURS] Like ini_read_flag, but ABSENT IS ON and the file itself is not
+    // allowed to answer "on" - only "off". PanelOverPicture is the one key this
+    // build adds, and its default is the reason the build exists.
+    bool ini_read_flag_on(const char *key)
+    {
+        char buf[INI_BYTES];
+        if (!ini_slurp(buf, sizeof buf)) return true;   // no ini at all: still on
+        const char *k = ini_find(buf, key);
+        if (k == nullptr) return true;                  // absent: on
+        if (k[0] == '\0') return true;                  // present but empty: on
+        return k[0] == '1';
     }
 
     // R212. Pass2Region=<percent of the frame's AREA, 10-99>. Absent, 100 or
