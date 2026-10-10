@@ -12781,6 +12781,71 @@ namespace
             return false;
         }
 
+        // ===================================================================
+        // [OURS] PRELOAD WHAT A PROXY-STYLE SNIPPET FORWARDS TO. NOT UPSTREAM.
+        //
+        // THE DEFECT, and it cost this rig the whole neural stage on 0.3.1.
+        // The Cost-Scaler proxy is what sits at <game>\bin\mgpu\nvngx_dlssnr.dll
+        // here. It intercepts four entry points and carries the REST of the NGX
+        // surface - 55 names, PopulateParameters_Impl among them - as LINKER
+        // FORWARDERS to nvngx_dlssnr_real.dll beside it.
+        //
+        // A forwarder is resolved by the loader against the modules ALREADY in
+        // the process (matched by base name) or the standard search order. It is
+        // NEVER resolved against the proxy's own folder. So before anything has
+        // called Init on the proxy, the real module is not in the process and
+        // every forwarded name answers missing - including the one line below
+        // that resolves STRICTLY from the snippet:
+        //
+        //   ngx_resolve_strict(mods.snippet, "...NVSDK_NGX_D3D12_PopulateParameters_Impl")
+        //
+        // That makes it a chicken and egg: the proxy loads the real module when
+        // its Init runs, and the Init never runs because the resolve that needs
+        // the real module fails first. The stream then reports the single line
+        // "an NGX entry point did not resolve - transport-only" and the neural
+        // layer never appears at all.
+        //
+        // 0.3.0 did not ask for that name, which is exactly why FC6 sat on
+        // 0.3.0 while KCD2 ran 0.3.1 - the version split on this rig was this
+        // one resolve, and nothing else.
+        //
+        // MEASURED, not reasoned: build\_dl\ngxprobe does these same two
+        // GetProcAddress calls against these same two modules outside the game.
+        // Without the preload PopulateParameters_Impl is null from BOTH modules;
+        // with it, all six of P4.1's entry points resolve.
+        //
+        // The load is a no-op when the real module is already in the process,
+        // and skips silently when the snippet is the real module itself - which
+        // is the KCD2 arrangement and every non-proxy install.
+        // ===================================================================
+        {
+            wchar_t sp[MAX_PATH] = {};
+            if (GetModuleFileNameW(mods.snippet, sp, MAX_PATH) != 0)
+            {
+                wchar_t *slash = wcsrchr(sp, L'\\');
+                if (slash != nullptr)
+                {
+                    *(slash + 1) = L'\0';
+                    wchar_t real[MAX_PATH] = {};
+                    swprintf_s(real, L"%lsnvngx_dlssnr_real.dll", sp);
+                    if (GetFileAttributesW(real) != INVALID_FILE_ATTRIBUTES &&
+                        GetModuleHandleW(L"nvngx_dlssnr_real.dll") == nullptr)
+                    {
+                        HMODULE h = LoadLibraryW(real);
+                        char l[MAX_PATH + 300];
+                        snprintf(l, sizeof l,
+                                 "[MGPU][OURS][P4.1] the private snippet is a PROXY: preloading its "
+                                 "forwarder target %ls -> %s. The strict resolve of "
+                                 "PopulateParameters_Impl below is satisfied by that module's export "
+                                 "through the proxy's forwarder, and a forwarder does not answer "
+                                 "until its target is in the process.",
+                                 real, (h != nullptr) ? "loaded" : "FAILED - the resolve below WILL fail");
+                        if (h != nullptr) mgpu::diag::info(l); else mgpu::diag::error(l);
+                    }
+                }
+            }
+        }
+
         char w[9][160] = {};
         ngx_pf_init           p_init  = (ngx_pf_init)          ngx_resolve(mods, "NVSDK_NGX_D3D12_Init",                    ngx_prefer::core,    w[0], sizeof w[0]);
         char w_iext41[160];
@@ -12801,6 +12866,23 @@ namespace
         if (p_init == nullptr || p_caps == nullptr || p_iext == nullptr || p_pop == nullptr ||
             p_cre == nullptr || s.nr_eval == nullptr)
         {
+            // [OURS] SAY WHICH ONE. Upstream reports that an entry point is
+            // missing and names none of them, so the next run cannot narrow
+            // anything - and on this rig that cost a launch, twice, before the
+            // name was found outside the game (build\_dl\ngxprobe). The w[]
+            // strings are already built by the resolvers for exactly this:
+            // "core+snippet(used:x)" for the two-module lookups and "yes"/"no"
+            // for the strict snippet ones.
+            char dl[760];
+            snprintf(dl, sizeof dl,
+                     "[MGPU][OURS][P4.1] RESOLVE DETAIL - Init[%s] Caps[%s] Init_Ext[%s] "
+                     "PopulateParameters[%s] CreateFeature[%s] EvaluateFeature[%s] | release[%s] "
+                     "shutdown[%s] destroy[%s] | Init_Ext(core)[%s]. A name reading 'missing' or "
+                     "'no' is the one that failed. core=- means the NGX core was not reachable; "
+                     "snippet=- means the private NR module was not - and if the snippet is a "
+                     "proxy, its FORWARDED names only answer once its target module is loaded.",
+                     w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8], w_iext41);
+            mgpu::diag::error(dl);
             mgpu::diag::error("[MGPU][P4.1] an NGX entry point did not resolve - transport-only");
             return false;
         }
