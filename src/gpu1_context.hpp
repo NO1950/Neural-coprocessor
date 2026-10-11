@@ -95,6 +95,36 @@ namespace mgpu::gpu1
     bool dcomp_explicit_off_single_display();
     bool dcomp_peek_toggle();
 
+    // ======================================================================
+    // [OURS] PanelOverPicture. NOT UPSTREAM - added 2026-10-11.
+    //
+    // THE DEFECT. With DcompOverlay=1 the composed visual is topmost on the
+    // game's window, so the game's own ReShade overlay - which ReShade draws
+    // into the GAME's back buffer and which therefore IS the layer under the
+    // visual - cannot be reached while the neural picture is up. dllmain
+    // steps the visual aside when an overlay opens, and the picture falls
+    // back to the native one for as long as the panel is up.
+    //
+    // WHAT THIS TURNS ON. The visual stays rooted and the panel is drawn by
+    // the runtime whose swapchain IS the neural picture (the GPU 1 runtime),
+    // so the panel lands ON TOP of the live neural frame and the native layer
+    // never comes back. mgpu.ini PanelOverPicture: absent or 1 = on (the
+    // point of the patch), 0 = the author's behaviour, byte for byte.
+    //
+    // dllmain owns the whole mechanism; this file owns only the key and the
+    // window handle the input mapping needs.
+    // ======================================================================
+    bool panel_over_picture();
+    // [OURS] Is the composed visual on screen right now? False before the
+    // first neural frame, and false while CTRL+ALT+F6 is peeking. dllmain
+    // reads it to decide whether the live panel has anywhere to be seen: with
+    // the visual unrooted, the GPU 1 runtime's overlay is composited into a
+    // swapchain nobody is looking at, so the author's path is the right one.
+    bool dcomp_visual_rooted();
+    // The GAME's HWND the visual is rooted on, for the live panel's input
+    // mapping. NULL until set_game_hwnd has run.
+    void *dcomp_game_hwnd();
+
     void stream_shutdown();
 
     void shutdown();
