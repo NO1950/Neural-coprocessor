@@ -106,6 +106,7 @@
 #include "gpu1_context.hpp"
 #include "nr16.hpp"       // R219-2: the panel reads the 16-bit keys with nr16's reader
 #include "discovery.hpp"  // D1 (0.3.0 R&D): the discovery calibrator, off unless Discovery=1
+#include "mgpu_ini_parser.hpp"  // R292: PanelOverPicture read at add-on load
 #include "latency_probe.hpp"  // D1.5a (0.3.0 R&D): read-only latency probe, off unless LatencyProbe=1
 #include "journal.hpp"        // D2.0: what / when / why journal, off unless Journal=1
 #include "stall_watch.hpp"    // D2.0: stall watch, off unless StallWatch=N
@@ -1015,6 +1016,51 @@ static int mgpu_game_is_native(int *out_quality = nullptr)
 //
 // PanelOverPicture=0 in mgpu.ini restores the author's behaviour exactly.
 // ===========================================================================
+// R292 (N01950). PanelOverPicture IS READ ONCE, AT ADD-ON LOAD, AND NOTHING OF THE
+// LIVE PANEL RUNS WITHOUT IT. The panel needs the reshade_overlay event, and that
+// event must be registered in DllMain with every other one (registering later
+// races ReShade's unsynchronised event list - see the D2.0 note at the
+// registrations). Its registration alone changes ReShade's per-present work for
+// every runtime, so it is registered ONLY when the key is 1. This one latch is the
+// single answer every call site below uses, so the panel can never be half on
+// (opened on the GPU 1 runtime with no input feed running). Quiet reader, as
+// latency_probe does: one file read, no log line unless the key is on.
+static std::atomic<int> g_p1_key{-1};   // -1 not read, 0 off, 1 on
+static bool p1_key()
+{
+    int v = g_p1_key.load(std::memory_order_acquire);
+    if (v >= 0) return v == 1;
+    v = 0;
+    wchar_t mod[MAX_PATH] = {};
+    const DWORD len = (g_module != nullptr) ? GetModuleFileNameW(g_module, mod, MAX_PATH) : 0;
+    wchar_t *slash = (len != 0 && len < MAX_PATH) ? wcsrchr(mod, L'\\') : nullptr;
+    if (slash != nullptr)
+    {
+        slash[1] = L'\0';
+        wchar_t path[MAX_PATH] = {};
+        _snwprintf_s(path, MAX_PATH, _TRUNCATE, L"%lsmgpu.ini", mod);
+        FILE *f = nullptr;
+        if (_wfopen_s(&f, path, L"rb") == 0 && f != nullptr)
+        {
+            static char buf[mgpu::config::MAX_BYTES + 2u];
+            const size_t got = fread(buf, 1, mgpu::config::MAX_BYTES + 1u, f);
+            fclose(f);
+            if (got <= mgpu::config::MAX_BYTES)
+            {
+                buf[got] = '\0';
+                const char *k = mgpu::config::find(buf, got, "PanelOverPicture");
+                v = (k != nullptr && *k == '1') ? 1 : 0;
+            }
+        }
+    }
+    int expect = -1;
+    if (g_p1_key.compare_exchange_strong(expect, v, std::memory_order_acq_rel) && v == 1)
+        mgpu::diag::info("[MGPU][R292] PanelOverPicture=1: with DcompOverlay=1 an open panel is drawn by the "
+                         "GPU 1 runtime over the live neural frame, and the game's input is blocked while it "
+                         "is up. Absent or 0: the shipped behaviour, and none of this code runs.");
+    return g_p1_key.load(std::memory_order_acquire) == 1;
+}
+
 static std::atomic<int> g_p1_live{0};          // 1 = the panel is up on the neural layer
 static std::atomic<int> g_p1_said_sizes{0};    // one line about the input mapping per run
 static std::atomic<int> g_p1_probe{0};         // [OURS] feed probe cadence (see live_panel_feed_input)
@@ -1141,7 +1187,7 @@ static void live_panel_feed_input(reshade::api::effect_runtime *runtime)
     do
     {
         if (runtime == nullptr) { why = "no runtime"; break; }
-        if (!mgpu::gpu1::dcomp_overlay_mode() || !mgpu::gpu1::panel_over_picture())
+        if (!mgpu::gpu1::dcomp_overlay_mode() || !p1_key())
         { why = "mode off (DcompOverlay/PanelOverPicture)"; break; }
         if (g_p1_live.load(std::memory_order_relaxed) == 0) { why = "panel not live"; break; }
 
@@ -1336,7 +1382,7 @@ static void on_reshade_overlay_live(reshade::api::effect_runtime *runtime)
                  g_rt_live.load(std::memory_order_relaxed),
                  g_rt_bridge.load(std::memory_order_relaxed),
                  g_p1_live.load(std::memory_order_relaxed),
-                 (int)mgpu::gpu1::dcomp_overlay_mode(), (int)mgpu::gpu1::panel_over_picture(),
+                 (int)mgpu::gpu1::dcomp_overlay_mode(), (int)p1_key(),
                  (double)io.MousePos.x, (double)io.MousePos.y,
                  (int)(io.MousePos.x != -FLT_MAX && io.MousePos.y != -FLT_MAX),
                  (int)io.MouseDrawCursor, (int)io.WantCaptureMouse, (int)io.MouseDown[0]);
@@ -2940,7 +2986,7 @@ static void on_init_effect_runtime(reshade::api::effect_runtime *runtime)
     // [OURS] P1. See the block above g_rt_live. Only the runtime with no window
     // is on screen; that one is the live panel's host, and only that one gets
     // the overlay opened and the input fed.
-    if (!is_game && runtime->get_hwnd() == nullptr)
+    if (p1_key() && !is_game && runtime->get_hwnd() == nullptr)   // R292: key off, nothing recorded
     {
         g_rt_live.store(runtime, std::memory_order_relaxed);
         if (g_p1_said_host.exchange(1, std::memory_order_relaxed) == 0)
@@ -3032,7 +3078,7 @@ static bool on_reshade_open_overlay(reshade::api::effect_runtime *runtime, bool 
         // [OURS] The live panel. See the block above g_p1_live for the whole
         // argument. PanelOverPicture=0 falls straight through to the author's
         // two lines.
-        if (mgpu::gpu1::panel_over_picture())
+        if (p1_key())
         {
             void *g = g_rt_game.load(std::memory_order_relaxed);
             void *b = g_rt_bridge.load(std::memory_order_relaxed);
@@ -3233,7 +3279,7 @@ static void on_present(reshade::api::command_queue *queue,
     // it. The runtime POINTER still comes from R160's re-latch and from
     // init_effect_runtime; only the moment of the call moved.
     if (swapchain != nullptr && (mgpu::gpu1::dcomp_explicit_off_single_display() ||
-                                 (mgpu::gpu1::dcomp_overlay_mode() && mgpu::gpu1::panel_over_picture())))
+                                 (p1_key() && mgpu::gpu1::dcomp_overlay_mode())))   // R292: key first - off never asks the mode here
     {
         reshade::api::device *pd = swapchain->get_device();
         if (pd != nullptr && pd->get_api() == reshade::api::device_api::d3d12)
@@ -3257,7 +3303,7 @@ static void on_present(reshade::api::command_queue *queue,
                 // Called on the runtime's own thread: this Present is the game
                 // chain's, and the flag it sets is read by that runtime's
                 // draw_gui on the same thread.
-                if (p_is_game && mgpu::gpu1::panel_over_picture() &&
+                if (p_is_game && p1_key() &&
                     g_p1_live.load(std::memory_order_relaxed) != 0)
                 {
                     auto *rtg = (reshade::api::effect_runtime *)g_rt_game.load(std::memory_order_relaxed);
@@ -3277,8 +3323,8 @@ static void on_present(reshade::api::command_queue *queue,
                 // a swapchain nobody is looking at. g_rt_live is the one that
                 // answers get_hwnd() == nullptr. Falls back to R158's slot when
                 // no such runtime has been seen yet.
-                const bool live_mode = mgpu::gpu1::dcomp_overlay_mode() &&
-                                       mgpu::gpu1::panel_over_picture();
+                const bool live_mode = p1_key() &&   // R292: key first
+                                       mgpu::gpu1::dcomp_overlay_mode();
                 void *target = p_is_game ? g_rt_game.load(std::memory_order_relaxed)
                                          : (live_mode ? g_rt_live.load(std::memory_order_relaxed)
                                                       : g_rt_bridge.load(std::memory_order_relaxed));
@@ -3296,7 +3342,7 @@ static void on_present(reshade::api::command_queue *queue,
                         // input feed and the destroy handler compare against,
                         // and it is set HERE because this is the only place
                         // open_overlay is called.
-                        if (!p_is_game && want != 0)
+                        if (live_mode && !p_is_game && want != 0)   // R292
                             g_p1_host.store((void *)rt, std::memory_order_relaxed);
                         echo.store(true, std::memory_order_relaxed);
                         rt->open_overlay(want != 0,
@@ -4032,7 +4078,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // path that runs whatever tab is selected, which no registered overlay
         // can offer. It is also what keeps block_input_next_frame() applying,
         // since the early-out branch is one of only two places ReShade reads it.
-        reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay_live);
+        if (p1_key())   // R292: registered only with PanelOverPicture=1 - see p1_key()
+            reshade::register_event<reshade::addon_event::reshade_overlay>(on_reshade_overlay_live);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);           // R242
