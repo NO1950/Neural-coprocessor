@@ -2,6 +2,8 @@
 
 Code contributed by people other than the primary author, and what it covers.
 
+## [NO1950](https://github.com/NO1950)
+
 Two changes to the add-on, from a two-GPU machine where the composition mode
 and the overlay could not be used at the same time:
 
