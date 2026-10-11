@@ -122,6 +122,63 @@
 #include "sl_probe.hpp"   // SL1
 #include "worker.hpp"
 
+// ---- [OURS] 2026-10-12: THE PANEL'S WHEEL -------------------------------------------
+// The panel's mouse is synthetic: live_panel_feed_input() writes its position and buttons
+// from the game's own state every frame (that is the "shadow cursor" on screen). The wheel
+// is the one input that CANNOT be polled - it exists only as a WM_MOUSEWHEEL message, and the
+// game consumes it before any UI sees it. So we listen for it ourselves.
+//
+// Two rules, both learned in this project:
+//  1. NEVER SWALLOW. CallNextHookEx runs on every event, so the game keeps every scroll it
+//     would have had; the panel gets a copy, not the event.
+//  2. THE HOOK'S THREAD MUST PUMP. A low-level hook whose thread does not pump stalls mouse
+//     input for the WHOLE DESKTOP. It gets its own thread and its own GetMessage loop.
+// NRPanelWheel=0 in mgpu.ini turns it off (default ON). It is installed on the first panel
+// frame, so a session that never opens the panel never installs anything.
+static std::atomic<long> g_panel_wheel{ 0 };
+static HHOOK             g_panel_wheel_hook = nullptr;
+
+static LRESULT CALLBACK panel_wheel_proc(int code, WPARAM w, LPARAM l)
+{
+    if (code == HC_ACTION && (w == WM_MOUSEWHEEL || w == WM_MOUSEHWHEEL))
+    {
+        const MSLLHOOKSTRUCT *ms = (const MSLLHOOKSTRUCT *)l;
+        if (ms != nullptr)
+        {
+            const short delta = (short)HIWORD(ms->mouseData);
+            if (delta != 0) g_panel_wheel.fetch_add((long)(delta / WHEEL_DELTA));
+        }
+    }
+    return CallNextHookEx(nullptr, code, w, l);   // rule 1
+}
+
+static DWORD WINAPI panel_wheel_thread(LPVOID)
+{
+    g_panel_wheel_hook = SetWindowsHookExW(WH_MOUSE_LL, panel_wheel_proc, nullptr, 0);
+    if (g_panel_wheel_hook == nullptr)
+    {
+        mgpu::diag::warn("[MGPU][OURS][WHEEL] hook FAILED to install - the panel will not scroll "
+                         "with the wheel (its scrollbar still works)");
+        return 0;
+    }
+    mgpu::diag::info("[MGPU][OURS][WHEEL] hook installed: low level, never swallows, pumped on "
+                     "its own thread");
+    MSG m;
+    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
+    UnhookWindowsHookEx(g_panel_wheel_hook);
+    g_panel_wheel_hook = nullptr;
+    return 0;
+}
+
+static void panel_wheel_ensure()
+{
+    static std::atomic<bool> started{ false };
+    bool expected = false;
+    if (!started.compare_exchange_strong(expected, true)) return;
+    HANDLE h = CreateThread(nullptr, 0, panel_wheel_thread, nullptr, 0, nullptr);
+    if (h != nullptr) CloseHandle(h);
+}
+
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Cross-Adapter Bridge P0: second ReShade effect runtime on a second GPU";
@@ -1236,6 +1293,14 @@ static void live_panel_feed_input(reshade::api::effect_runtime *runtime)
         io.MouseDown[0] = ldown;
         io.MouseDown[1] = rdown;
         io.MouseDown[2] = (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+        // [OURS] 2026-10-12: the wheel. It cannot be polled like the buttons can - it exists
+        // only as a message the game consumes - so the hook above collects the
+        // notches (without swallowing them) and they are handed to ImGui here.
+        {
+        panel_wheel_ensure();
+            const long wh = g_panel_wheel.exchange(0);
+            if (wh != 0) io.MouseWheel += (float)wh;
+        }
         io.KeyCtrl  = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         io.KeyShift = (GetAsyncKeyState(VK_SHIFT)   & 0x8000) != 0;
         io.KeyAlt   = (GetAsyncKeyState(VK_MENU)    & 0x8000) != 0;
@@ -1440,12 +1505,68 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *runtime)
     const float col_w   = two_col
         ? (avail_w - ImGui::GetStyle().ItemSpacing.x) * 0.5f
         : avail_w;
-    // Tall enough that neither column scrolls in the common case, short enough
-    // to leave the probe section visible underneath.
-    const float col_h   = 560.0f;
+    // [OURS] 2026-10-12: THE OPERATOR'S POINT, AND IT WAS RIGHT. 560 was a guess, and it
+    // was the whole bug: the two boxes stopped there and everything below - inside a window
+    // that already reaches the display's height - was dead space, while the left box's own
+    // content ran past 560 and needed the panel scrollbar (that is exactly how the Neural
+    // scale controls got "hidden", and why the log box that briefly filled this space was
+    // the only thing visible in it). Take the region that is actually available, minus the
+    // room the Probe section and the warning lines need underneath the boxes.
+    const float col_h   = ImGui::GetContentRegionAvail().y - 130.0f;
 
     ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
     ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
+
+    // [OURS] 2026-10-12. The two columns are the BOX pair above (mgpu_box_bridge and
+    // mgpu_box_dlss), each sized to the region that is actually available. An earlier attempt
+    // of mine used ImGui::Columns() here instead; it was removed because columns lay out at
+    // their CONTENT's height, so they can never claim the space below - which is the whole
+    // thing the operator was pointing at.
+    // PANEL SCALE, and the honest reason for it.
+    //
+    // The operator's actual complaint, in their words: the left column hides the Neural
+    // scale controls below the fold and the panel's own scrollbar has to be dragged to
+    // reach them - "make both columns taller so they use the black area below, then I do
+    // not need the wheel". The black area is not unused column space: ReShade's overlay
+    // window is already at the display's height, so there is nothing below to grow into.
+    // The only way to show everything at once is to make the content SHORTER - so the whole
+    // tab is scaled down (io.FontGlobalScale). PanelScale=0.85 by default; 0.75 fits more,
+    // 1.00 is ReShade's own size.
+    {
+        static float panel_scale = -1.0f;
+        if (panel_scale < 0.0f)
+        {
+            float v = 0.85f;
+            // read once per session; the panel is not the place to re-read a file every frame
+            wchar_t ini[MAX_PATH] = {};
+            HMODULE self = nullptr;
+            GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&draw_mgpu_overlay, &self);
+            char mod[MAX_PATH] = {};
+            if (self != nullptr && GetModuleFileNameA(self, mod, MAX_PATH) > 0)
+            {
+                char *slash = strrchr(mod, '\\');
+                if (slash != nullptr)
+                {
+                    *slash = 0;
+                    char path[MAX_PATH] = {};
+                    snprintf(path, sizeof path, "%s\\mgpu.ini", mod);
+                    FILE *f = fopen(path, "rb");
+                    if (f != nullptr)
+                    {
+                        char buf[65536];
+                        const size_t got = fread(buf, 1, sizeof buf - 1, f);
+                        buf[got] = 0;
+                        fclose(f);
+                        const char *k = strstr(buf, "PanelScale=");
+                        if (k != nullptr) { const float pv = (float)atof(k + 11); if (pv > 0.5f && pv <= 1.5f) v = pv; }
+                    }
+                }
+            }
+            panel_scale = v;
+        }
+        ImGui::GetIO().FontGlobalScale = panel_scale;
+    }
     {
     // ---- Model tuning, first and always visible ----
     //
@@ -1723,11 +1844,74 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *runtime)
         ImGui::SeparatorText("Live");
         char lv[260];
 
-        snprintf(lv, sizeof lv, "fps   game %.1f   GPU 1 %.1f",
-                 st.fps_produced, st.fps_consumed);
+        // [OURS] 2026-10-12. THE OPERATOR WAS RIGHT ABOUT THIS PAIR. "GPU 1" counts what
+        // the consumer FINISHED, and a finished frame is not necessarily a shown one, so
+        // it reads high. The displayed cadence is the bridge's own present ring - and it
+        // is given as percentiles, because an average hides the stalls an eye notices.
+        snprintf(lv, sizeof lv, "ON SCREEN  %.1f fps   p50 %.2f ms   p99 %.2f ms   1%% low %.2f ms   (n=%u)",
+                 st.present_fps, st.present_p50_ms, st.present_p99_ms, st.present_low1_ms, st.present_n);
         ImGui::TextUnformatted(lv);
+        snprintf(lv, sizeof lv, "game render %.1f   GPU 1 finished %.1f   (neither is what you see)",
+                 st.fps_produced, st.fps_consumed);
+        ImGui::TextDisabled(lv);
         if (st.fps_consumed + 1.0 < st.fps_produced)
             ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
+
+        // ---- [OURS] the neural scale, live (2026-10-12) ----
+        ImGui::SeparatorText("Neural scale (our own path)");
+        if (!st.nrs_on)
+        {
+            ImGui::TextDisabled("NRScale is unset in mgpu.ini - the 1:1 path is running.");
+        }
+        else
+        {
+            float sc = st.nrs_scale;
+            ImGui::SetNextItemWidth(200.0f);
+            // 2026-10-12: the top of the range is 1.00 now. Above it the snippet would need a
+            // larger FEATURE, and rebuilding a feature leaks NGX memory it never returns
+            // (measured: +1.5-2.4 GB per rebuild). Below it, a change only resizes our own
+            // two scratch textures, so dragging this is free.
+            const float nr_top = (st.nrs_cap > 1.0f) ? st.nrs_cap : 1.0f;   // ini NRScaleCap
+            if (ImGui::SliderFloat("NRScale", &sc, 0.30f, nr_top, "%.2f"))
+                mgpu::gpu1::ui_nrs_stage(sc);
+            ImGui::SameLine();
+            // A per-knob way back. The operator pulled a slider too far and could not remember
+            // where it started; asking a log file for the default is not a user interface.
+            if (ImGui::SmallButton("default##nrs_scale")) mgpu::gpu1::ui_nrs_stage(0.75f);
+            ImGui::TextDisabled("Applied on the next frame; rebuilds the feature in place (~0.3 s, one Reset frame).");
+            snprintf(lv, sizeof lv, "work %ux%u  ->  native %ux%u    rebuilds %llu   last %.1f s ago",
+                     st.nrs_work_w, st.nrs_work_h, st.nrs_native_w, st.nrs_native_h,
+                     st.nrs_rebuilds, st.since_rebuild_ms / 1000.0);
+            ImGui::TextUnformatted(lv);
+            if (st.nrs_probe_d >= 0.0)
+                snprintf(lv, sizeof lv, "neural effect   mean|composite-native| = %.4f", st.nrs_probe_d);
+            else
+                snprintf(lv, sizeof lv, "neural effect   (set NRProbe=1 in mgpu.ini to measure it)");
+            ImGui::TextUnformatted(lv);
+            float g = st.nrs_gain, sh = st.nrs_sharpness, co = st.nrs_color;
+            int   mo = (int)st.nrs_mode;
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::SliderFloat("detail gain", &g, 0.0f, 2.0f, "%.2f"))      mgpu::gpu1::ui_nrs_set(0, g);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("default##nrs_gain")) mgpu::gpu1::ui_nrs_set(0, 1.00f);
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::SliderFloat("sharpness", &sh, 0.0f, 1.0f, "%.2f"))        mgpu::gpu1::ui_nrs_set(1, sh);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("default##nrs_sharp")) mgpu::gpu1::ui_nrs_set(1, 0.50f);
+            ImGui::SetNextItemWidth(200.0f);
+            if (ImGui::SliderFloat("colour strength", &co, 0.0f, 1.0f, "%.2f"))  mgpu::gpu1::ui_nrs_set(2, co);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("default##nrs_col")) mgpu::gpu1::ui_nrs_set(2, 0.90f);
+            if (ImGui::RadioButton("residual", mo == 1)) mgpu::gpu1::ui_nrs_set(3, 1.0f);
+            ImGui::SameLine();
+            if (ImGui::RadioButton("direct", mo == 0))   mgpu::gpu1::ui_nrs_set(3, 0.0f);
+            ImGui::SameLine();
+            if (ImGui::SmallButton("default##nrs_mode")) mgpu::gpu1::ui_nrs_set(3, 1.0f);
+            ImGui::TextDisabled("Defaults: 0.75 / gain 1.00 / sharp 0.50 / colour 0.90 / residual.");
+            ImGui::TextDisabled("These three are live with no rebuild, and they persist to mgpu.ini.");
+        ImGui::TextDisabled("NRScale: the feature is built once at 1.00 and never rebuilt. A change");
+        ImGui::TextDisabled("resizes only our scratch pair (~30-45 MB), 350 ms after you let go.");
+        }
 
         if (st.gpu1_ts_ok)
         {
@@ -1786,6 +1970,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *runtime)
     // stall on the bridge thread, down a teardown path that has crashed
     // before. These are set in mgpu.ini and take effect on the next arm.
     ImGui::BeginChild("mgpu_box_dlss", ImVec2(col_w, col_h), true);
+
     ImGui::SeparatorText("DLSS  -  super resolution and Reflex");
     {
         char dl[300];
@@ -2814,8 +2999,9 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *runtime)
     }
 
     ImGui::TextDisabled("Something wrong? Send ReShade.log from the game's exe folder to:");
-    ImGui::TextDisabled("github.com/maohgad-web/Neural-coprocessor");
-}
+    // [OURS] 2026-10-12: close the two-column layout and its wrap (this is the real
+    // end of draw_mgpu_overlay - the first attempt landed in the next function).
+    ImGui::TextDisabled("github.com/maohgad-web/Neural-coprocessor");}
 #endif
 
 // P1.5: the only event this add-on subscribes to that is raised on the GAME's
