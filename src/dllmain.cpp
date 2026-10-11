@@ -123,63 +123,6 @@
 #include "sl_probe.hpp"   // SL1
 #include "worker.hpp"
 
-// ---- [OURS] 2026-10-12: THE PANEL'S WHEEL -------------------------------------------
-// The panel's mouse is synthetic: live_panel_feed_input() writes its position and buttons
-// from the game's own state every frame (that is the "shadow cursor" on screen). The wheel
-// is the one input that CANNOT be polled - it exists only as a WM_MOUSEWHEEL message, and the
-// game consumes it before any UI sees it. So we listen for it ourselves.
-//
-// Two rules, both learned in this project:
-//  1. NEVER SWALLOW. CallNextHookEx runs on every event, so the game keeps every scroll it
-//     would have had; the panel gets a copy, not the event.
-//  2. THE HOOK'S THREAD MUST PUMP. A low-level hook whose thread does not pump stalls mouse
-//     input for the WHOLE DESKTOP. It gets its own thread and its own GetMessage loop.
-// NRPanelWheel=0 in mgpu.ini turns it off (default ON). It is installed on the first panel
-// frame, so a session that never opens the panel never installs anything.
-static std::atomic<long> g_panel_wheel{ 0 };
-static HHOOK             g_panel_wheel_hook = nullptr;
-
-static LRESULT CALLBACK panel_wheel_proc(int code, WPARAM w, LPARAM l)
-{
-    if (code == HC_ACTION && (w == WM_MOUSEWHEEL || w == WM_MOUSEHWHEEL))
-    {
-        const MSLLHOOKSTRUCT *ms = (const MSLLHOOKSTRUCT *)l;
-        if (ms != nullptr)
-        {
-            const short delta = (short)HIWORD(ms->mouseData);
-            if (delta != 0) g_panel_wheel.fetch_add((long)(delta / WHEEL_DELTA));
-        }
-    }
-    return CallNextHookEx(nullptr, code, w, l);   // rule 1
-}
-
-static DWORD WINAPI panel_wheel_thread(LPVOID)
-{
-    g_panel_wheel_hook = SetWindowsHookExW(WH_MOUSE_LL, panel_wheel_proc, nullptr, 0);
-    if (g_panel_wheel_hook == nullptr)
-    {
-        mgpu::diag::warn("[MGPU][OURS][WHEEL] hook FAILED to install - the panel will not scroll "
-                         "with the wheel (its scrollbar still works)");
-        return 0;
-    }
-    mgpu::diag::info("[MGPU][OURS][WHEEL] hook installed: low level, never swallows, pumped on "
-                     "its own thread");
-    MSG m;
-    while (GetMessageW(&m, nullptr, 0, 0) > 0) { TranslateMessage(&m); DispatchMessageW(&m); }
-    UnhookWindowsHookEx(g_panel_wheel_hook);
-    g_panel_wheel_hook = nullptr;
-    return 0;
-}
-
-static void panel_wheel_ensure()
-{
-    static std::atomic<bool> started{ false };
-    bool expected = false;
-    if (!started.compare_exchange_strong(expected, true)) return;
-    HANDLE h = CreateThread(nullptr, 0, panel_wheel_thread, nullptr, 0, nullptr);
-    if (h != nullptr) CloseHandle(h);
-}
-
 extern "C" __declspec(dllexport) const char *NAME = "MGPU Bridge";
 extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Cross-Adapter Bridge P0: second ReShade effect runtime on a second GPU";
