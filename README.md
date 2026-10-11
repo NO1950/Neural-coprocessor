@@ -187,7 +187,7 @@ The last row is a limitation rather than a fault - see Limitations. Neural rende
 | Resolution | 1920x1080 and 3840x2160 | 2560x1440 |
 | Result | Freezes about 2 seconds after the stream starts | Ran to the end, no freeze |
 
-The 617.42 result on my side is one run on one rig. It does not show that this driver works on every setup. If your setup matches the reporter's, 0.3.0 and 0.3.1 are not expected to work on it for now. If you see the same freeze on a different setup, please report it with your driver version.
+The 617.42 result on my side is one run on one rig. It does not show that this driver works on every setup. If your setup matches the reporter's, An earlier version than 0.3.0 or DcompOverlay=0 may fix the freeze issue.. If you see the same freeze on a different setup, please report it with your driver version.
 
 ### Starfield, experimental
 
