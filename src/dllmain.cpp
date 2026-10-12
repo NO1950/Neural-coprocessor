@@ -1037,7 +1037,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // scale controls got "hidden", and why the log box that briefly filled this space was
     // the only thing visible in it). Take the region that is actually available, minus the
     // room the Probe section and the warning lines need underneath the boxes.
-    const float col_h   = ImGui::GetContentRegionAvail().y - 130.0f;
+    const float col_h   = st.nrs_on ? (ImGui::GetContentRegionAvail().y - 130.0f) : 560.0f;   // R299: main's 560 unless NRScale is set
 
     ImGui::BeginChild("mgpu_box_bridge", ImVec2(col_w, col_h), true);
     ImGui::SeparatorText("MGPU BRIDGE  -  neural rendering");
@@ -1090,7 +1090,7 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             }
             panel_scale = v;
         }
-        ImGui::GetIO().FontGlobalScale = panel_scale;
+        if (st.nrs_on) ImGui::GetIO().FontGlobalScale = panel_scale;   // R299: ReShade's font scale is untouched unless NRScale is set
     }
     {
     // ---- Model tuning, first and always visible ----
@@ -1373,23 +1373,26 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
         // the consumer FINISHED, and a finished frame is not necessarily a shown one, so
         // it reads high. The displayed cadence is the bridge's own present ring - and it
         // is given as percentiles, because an average hides the stalls an eye notices.
-        snprintf(lv, sizeof lv, "ON SCREEN  %.1f fps   p50 %.2f ms   p99 %.2f ms   1%% low %.2f ms   (n=%u)",
-                 st.present_fps, st.present_p50_ms, st.present_p99_ms, st.present_low1_ms, st.present_n);
+        if (st.nrs_on)   // R299: the new readout only with NRScale set; main's line otherwise
+            snprintf(lv, sizeof lv, "ON SCREEN  %.1f fps   p50 %.2f ms   p99 %.2f ms   1%% low %.2f ms   (n=%u)",
+                     st.present_fps, st.present_p50_ms, st.present_p99_ms, st.present_low1_ms, st.present_n);
+        else
+            snprintf(lv, sizeof lv, "fps   game %.1f   GPU 1 %.1f",
+                     st.fps_produced, st.fps_consumed);
         ImGui::TextUnformatted(lv);
-        snprintf(lv, sizeof lv, "game render %.1f   GPU 1 finished %.1f   (neither is what you see)",
-                 st.fps_produced, st.fps_consumed);
-        ImGui::TextDisabled(lv);
+        if (st.nrs_on)
+        {
+            snprintf(lv, sizeof lv, "game render %.1f   GPU 1 finished %.1f   (neither is what you see)",
+                     st.fps_produced, st.fps_consumed);
+            ImGui::TextDisabled(lv);
+        }
         if (st.fps_consumed + 1.0 < st.fps_produced)
             ImGui::TextDisabled("GPU 1 behind the game - frames are being skipped, not dropped.");
 
         // ---- [OURS] the neural scale, live (2026-10-12) ----
-        ImGui::SeparatorText("Neural scale (our own path)");
-        if (!st.nrs_on)
+        if (st.nrs_on)   // R299: the whole section only with NRScale set
         {
-            ImGui::TextDisabled("NRScale is unset in mgpu.ini - the 1:1 path is running.");
-        }
-        else
-        {
+            ImGui::SeparatorText("Neural scale (our own path)");
             float sc = st.nrs_scale;
             ImGui::SetNextItemWidth(200.0f);
             // 2026-10-12: the top of the range is 1.00 now. Above it the snippet would need a

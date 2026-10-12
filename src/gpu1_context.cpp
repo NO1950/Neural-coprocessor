@@ -1304,6 +1304,7 @@ void report_process_census_at_arm();
 static double        g_pr_ms[180] = {};
 static unsigned      g_pr_n = 0u, g_pr_i = 0u;
 static LARGE_INTEGER g_pr_last{};
+static std::atomic<int> g_pr_on{0};   // R299: the sampler runs only when the NRScale path armed
 
 bool present_frame(float r, float g, float b)
 {
@@ -1315,6 +1316,7 @@ bool present_frame(float r, float g, float b)
     // the panel's "GPU 1" figure counts what the consumer FINISHED, and the operator
     // measured it reading HIGH on this rig - the consumer can finish frames that are
     // superseded before they are ever shown. Percentiles are computed in ui_read.
+    if (g_pr_on.load(std::memory_order_relaxed) != 0)   // R299: off without NRScale
     {
         LARGE_INTEGER pr_now{}, pr_f{};
         QueryPerformanceCounter(&pr_now);
@@ -13725,8 +13727,11 @@ namespace
             s.nrs_mode      = (unsigned)ini_read_float("NRMode", 1.0f);
             s.nrs_sharpness = ini_read_float("NRSharpness", 0.50f);
             s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
-            const bool nrs_want = (nrs_scx > 0.05f && nrs_scx <= 2.0f) ||
-                                  (nrs_scy > 0.05f && nrs_scy <= 2.0f);
+            // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
+            // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
+            const bool nrs_want = ini_has_key("NRScale") &&
+                                  ((nrs_scx > 0.05f && nrs_scx <= 2.0f) ||
+                                   (nrs_scy > 0.05f && nrs_scy <= 2.0f));
             s.nrs_on = false;
             if (nrs_want)
             {
@@ -13771,6 +13776,7 @@ namespace
                 if (nrs_init(ndev, s, line, sizeof line) && nrs_alloc(ndev, s, line, sizeof line))
                 {
                     s.nrs_on = true;
+                    g_pr_on.store(1, std::memory_order_relaxed);   // R299
                     s.nrs_dev = ndev;
                     s.nrs_cre_v = (void *)p_cre;   // [OURS] NRS: stashed for live scale changes
                     s.nrs_live = true;
@@ -17447,6 +17453,7 @@ void ui_read(ui_state &out)
     // The displayed cadence, from the present ring. PERCENTILES, not a mean: an average
     // hides exactly the stalls the eye notices, which is why the old pair read wrong.
     out.present_peek = false;   // (the rooting state lives on the present side; see below)
+    if (s.nrs_on)   // R299: no sort on the panel's thread without NRScale
     {
         double v[180]; unsigned n = g_pr_n; if (n > 180u) n = 180u;
         for (unsigned i = 0; i < n; ++i) v[i] = g_pr_ms[i];
@@ -17686,6 +17693,7 @@ void ui_set_tuning_value(int which, float v)
     // only thing missing was the write side - which is why a panel change used to vanish on
     // the next launch. Tuning=1 goes with them, or the next arm reads the values and ignores
     // them because the group was never enabled.
+    if (s.nrs_on)   // R299: the tuning keys persist only with NRScale set (one key for the contributed path)
     {
         const char *fkey = (which == 0) ? "ToneStrength" : (which == 1) ? "StructureStrength"
                          : (which == 2) ? "SkinStrength"  : (which == 3) ? "Style" : nullptr;
