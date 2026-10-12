@@ -13782,9 +13782,9 @@ namespace
                     s.nrs_live = true;
                     snprintf(line, sizeof line,
                              "[MGPU][OURS][NRS] scale x=%.3f y=%.3f -> work=%ux%u native=%ux%u "
-                             "gain=%.2f sharp=%.2f fmt=%d: PSOs built, scratch allocated. STEP 1 - "
-                             "NOTHING IS DISPATCHED and no NGX parameter is touched, so the picture "
-                             "must be identical; step 2 adds the dispatches and the work-sized feature.",
+                             "gain=%.2f sharp=%.2f fmt=%d: PSOs built, scratch allocated. Each evaluate "
+                             "downsamples to the work extent, runs DLSS-NR there and composites the "
+                             "residual onto the native frame (R299c: text updated).",
                              (double)nrs_scx, (double)nrs_scy, s.nrs_w, s.nrs_h, s.width, s.height,
                              (double)s.nrs_gain, (double)s.nrs_sharpness, (int)s.format);
                     mgpu::diag::info(line);
@@ -13800,14 +13800,7 @@ namespace
                     // f=610 at 23:32:06.565, probe issue at 23:32:06.601) - the neural visual
                     // froze on screen, which is exactly what the operator reported. An
                     // instrument that can hang the thing it measures is not an instrument.
-                    char nrs_pb[8];
-                    if (ini_read_word("NRProbe", '0') != '0')
-                    {
-                        s.nrs_probe_enable = true;
-                        mgpu::diag::warn("[MGPU][OURS][NRS] NRProbe=1: the numeric readback probe is ON. It is "
-                                         "KNOWN to have frozen the stream once (23:32 run) - use it knowingly.");
-                    }
-                    (void)nrs_pb;
+                    // R299c: the probe is armed once, below, outside this branch (N01950's 0001).
                 }
                 else
                 {
@@ -13824,7 +13817,9 @@ namespace
         // - that is the reference number we have never had. So it is armed by
         // NRProbe alone, and its per-frame hook lives after the pass loop where the
         // final image exists, not inside the NRS branch.
-        if (ini_read_word("NRProbe", '0') != '0')
+        // R299c: ini_read_word returns bool; the old "!= '0'" was true for every value and
+        // for an absent key, so the probe armed on every launch. NRProbe=1 only, now.
+        if (ini_read_word("NRProbe", '1'))
         {
             s.nrs_probe_enable = true;
             if (nrs_probe_init(ndev, s, line, sizeof line))
