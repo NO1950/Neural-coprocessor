@@ -5443,7 +5443,19 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
         // !P3: P1.4's control is the LOCAL NR output for the SYNTHETIC
         // pattern. Running it against a real frame would compare two
         // different inputs and report the difference as a transit fault.
-        if (!P3 && ref_local != nullptr && st().game_luid_known)
+        // R302: P1.4 is behind TransitProbes=1, off by default. It is a
+        // closed question, and transit_make_device() below hands back the
+        // GAME's own device (D3D12 keeps one per adapter), so before R302 this
+        // block put a shared heap, a queue and copies on the game's device on
+        // every launch. Nothing outside this block reads its verdict; skipping it
+        // leaves the rest of the NGX probe (Init, P1.2, OutOfDate retry)
+        // exactly as it was. P3 runs never reach P1.4 either way.
+        if (!P3 && !ini_read_flag("TransitProbes"))
+            mgpu::diag::info("[MGPU][R302] P1.4 transit block NOT RUN: mgpu.ini TransitProbes is "
+                             "not 1 (the default). The NGX probe above is unaffected; only the "
+                             "cross-GPU round trip on the game's device is skipped. This is a "
+                             "setting, not a fault.");
+        else if (!P3 && ref_local != nullptr && st().game_luid_known)
         {
             ID3D12Device *dev0 = nullptr;
             ID3D12CommandQueue *q0 = nullptr;
@@ -5805,13 +5817,17 @@ bool ngx_probe(UINT width, UINT height, const ngx_input_frame *ext)
 // This is the first milestone that involves the bus at all. Everything
 // before it lived entirely on GPU 1.
 //
-// WHAT IT DELIBERATELY DOES NOT DO: touch the game's device. P0_RECORD
+// WHAT IT WAS MEANT NOT TO DO: touch the game's device. P0_RECORD
 // section 01 records that the accessor reaching the game's D3D12 objects
-// was never written, and this probe does not write it. It creates its OWN
-// device on the game's ADAPTER instead - two D3D12 devices on one adapter
-// is ordinary - so the only thing at risk is our own state. Reading the
-// game's actual frame needs the game's device and belongs to P1.4; the
-// question here is narrower and can be answered without it.
+// was never written, and this probe does not write it. It calls
+// D3D12CreateDevice on the game's ADAPTER instead, on the belief that this
+// made a second device.
+// R302: IT DOES NOT. D3D12 keeps one device per adapter per process and
+// D3D12CreateDevice returns the existing one, so g0.dev below IS the game's
+// device (ReShade logged this probe's CreateCommandQueue against the same
+// device pointer the game created its queues on). Everything this probe
+// creates on GPU 0 - queue, heaps, placed resources, copies - lands on the
+// game's device. The startup run is behind TransitProbes=1 since R302.
 //
 // THE GATING QUESTION. P0 measured CrossAdapterRowMajorTextureSupported = 0
 // on this rig, so cross-adapter TEXTURES are unavailable. Shared BUFFERS
@@ -6150,7 +6166,8 @@ bool transit_probe(const char *tag)
         HRESULT hr1 = transit_make_device(luid1, &g1.dev);
         snprintf(line, sizeof line,
                  "[MGPU][P1.3] own devices: gpu0(game adapter) hr=0x%08X luid=%08lX-%08lX | "
-                 "gpu1 hr=0x%08X luid=%08lX-%08lX (the game's own device is NOT touched)",
+                 "gpu1 hr=0x%08X luid=%08lX-%08lX (R302: on gpu0 D3D12 returns the GAME's own "
+                 "device - one device per adapter - so this probe works on the game's device)",
                  (unsigned)hr0, (unsigned long)luid0.HighPart, (unsigned long)luid0.LowPart,
                  (unsigned)hr1, (unsigned long)luid1.HighPart, (unsigned long)luid1.LowPart);
         mgpu::diag::info(line);
@@ -9453,9 +9470,6 @@ namespace
         unsigned nrs_mode = 1u;      // resolve mode: 1 = residual composite (default), 0 = the model output directly
         float nrs_sharpness = 0.50f;         // RCAS, matched to the proxys ini (Sharpness=0.50)
         float nrs_color_strength = 0.90f;    // matched to the proxys ini (ColorStrength=0.90)
-        // NRScaleResolveDepth=0 (Dom / lordzaxxon555-art): the resolve's silhouette guard runs
-        // without depth (has_depth=0) while NGX keeps it. Absent or 1 = unchanged.
-        bool  nrs_res_depth = true;
         unsigned nrs_w = 0u, nrs_h = 0u;
         UINT  nrs_inc = 0u;
         ID3D12RootSignature *nrs_rs_down = nullptr;
@@ -13772,8 +13786,6 @@ namespace
             s.nrs_mode      = (unsigned)ini_read_float("NRMode", 1.0f);
             s.nrs_sharpness = ini_read_float("NRSharpness", 0.50f);
             s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
-            s.nrs_res_depth = !ini_has_key("NRScaleResolveDepth") ||
-                              ini_read_flag("NRScaleResolveDepth");   // absent = unchanged
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
             const bool nrs_want = ini_has_key("NRScale") &&
@@ -15201,14 +15213,6 @@ bool stream_present_gate(unsigned long timeout_ms)
         else
         {
             f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
-            // PerfPrefetch=1 (with Perf11=1) only. The consume loop then waits for the frame the
-            // copy queue ARMED (s.cq_issued), which can be ahead of consumed+1. consumed+1 has
-            // usually arrived already, so the wait below returned at once and the bridge thread
-            // spun: 7.6 M gate calls and ~2000 [R167] lines/min in a 22-min Starfield run. Wait
-            // for the armed frame instead - the same arrival the copy queue itself waits for.
-            // PerfPrefetch absent: unchanged.
-            if (mgpu::t119::prefetch_active() && s.cq_gated && s.cq_issued > s.consumed + 1ull)
-                want = (UINT64)s.cq_issued;
             ++s.gate_idle;
         }
     }
@@ -15320,6 +15324,15 @@ bool stream_present_gate(unsigned long timeout_ms)
 bool probes_enabled()
 {
     return ini_read_probes();
+}
+
+// R302. TransitProbes=1 runs the two startup transit probes that work on the
+// game's device: the P1.3 startup run (worker.cpp) and the P1.4 block inside
+// ngx_probe. Off when absent. Only the literal 1 counts, like every flag read
+// through ini_read_flag.
+bool transit_probes_enabled()
+{
+    return ini_read_flag("TransitProbes");
 }
 
 // P7.10. Both read the same mgpu.ini the arm line reports, through the same
@@ -24105,13 +24118,6 @@ void stream_poll()
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true);
                         ID3D12Resource *nrs_depth = nullptr;
                         (void)s.nr_params->Get("DLSSNR.Depth", &nrs_depth);
-                        // NRScaleResolveDepth=0: the composite runs without its depth guard, as
-                        // when no depth is bound; NGX above still gets depth. On Starfield
-                        // (3840x2160, NRScale=0.75, Depth=1) the guard - native depth at 5 taps,
-                        // residual cut to 25% above a 0.02 relative range - put vertical stripes
-                        // and a dark veil on the shadowed side of faces. The bind line below then
-                        // reports depth=0.
-                        if (!s.nrs_res_depth) nrs_depth = nullptr;
                         // Depth is a GIFT, not a given: the proxy validates it before
                         // binding (SRV allowed, and the size must be the native one)
                         // and falls back to a harmless SRV with hasDepth=0 otherwise.
