@@ -9453,6 +9453,9 @@ namespace
         unsigned nrs_mode = 1u;      // resolve mode: 1 = residual composite (default), 0 = the model output directly
         float nrs_sharpness = 0.50f;         // RCAS, matched to the proxys ini (Sharpness=0.50)
         float nrs_color_strength = 0.90f;    // matched to the proxys ini (ColorStrength=0.90)
+        // NRScaleResolveDepth=0 (Dom / lordzaxxon555-art): the resolve's silhouette guard runs
+        // without depth (has_depth=0) while NGX keeps it. Absent or 1 = unchanged.
+        bool  nrs_res_depth = true;
         unsigned nrs_w = 0u, nrs_h = 0u;
         UINT  nrs_inc = 0u;
         ID3D12RootSignature *nrs_rs_down = nullptr;
@@ -13769,6 +13772,8 @@ namespace
             s.nrs_mode      = (unsigned)ini_read_float("NRMode", 1.0f);
             s.nrs_sharpness = ini_read_float("NRSharpness", 0.50f);
             s.nrs_color_strength = ini_read_float("NRColorStrength", 0.90f);
+            s.nrs_res_depth = !ini_has_key("NRScaleResolveDepth") ||
+                              ini_read_flag("NRScaleResolveDepth");   // absent = unchanged
             // R299: ONE KEY. The NRScale key must be PRESENT; absent = this whole path is off
             // and the arm is identical to main (ini_read_float's 1.0 default no longer turns it on).
             const bool nrs_want = ini_has_key("NRScale") &&
@@ -15196,6 +15201,14 @@ bool stream_present_gate(unsigned long timeout_ms)
         else
         {
             f = s.nfence; want = (UINT64)(s.consumed + 1); ev = s.gate_ev;
+            // PerfPrefetch=1 (with Perf11=1) only. The consume loop then waits for the frame the
+            // copy queue ARMED (s.cq_issued), which can be ahead of consumed+1. consumed+1 has
+            // usually arrived already, so the wait below returned at once and the bridge thread
+            // spun: 7.6 M gate calls and ~2000 [R167] lines/min in a 22-min Starfield run. Wait
+            // for the armed frame instead - the same arrival the copy queue itself waits for.
+            // PerfPrefetch absent: unchanged.
+            if (mgpu::t119::prefetch_active() && s.cq_gated && s.cq_issued > s.consumed + 1ull)
+                want = (UINT64)s.cq_issued;
             ++s.gate_idle;
         }
     }
@@ -24092,6 +24105,13 @@ void stream_poll()
                                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, true);
                         ID3D12Resource *nrs_depth = nullptr;
                         (void)s.nr_params->Get("DLSSNR.Depth", &nrs_depth);
+                        // NRScaleResolveDepth=0: the composite runs without its depth guard, as
+                        // when no depth is bound; NGX above still gets depth. On Starfield
+                        // (3840x2160, NRScale=0.75, Depth=1) the guard - native depth at 5 taps,
+                        // residual cut to 25% above a 0.02 relative range - put vertical stripes
+                        // and a dark veil on the shadowed side of faces. The bind line below then
+                        // reports depth=0.
+                        if (!s.nrs_res_depth) nrs_depth = nullptr;
                         // Depth is a GIFT, not a given: the proxy validates it before
                         // binding (SRV allowed, and the size must be the native one)
                         // and falls back to a harmless SRV with hasDepth=0 otherwise.
