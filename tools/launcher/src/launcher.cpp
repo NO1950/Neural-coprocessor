@@ -101,6 +101,7 @@ namespace
     const COLORREF C_SEL  = RGB(18, 19, 21);
     const COLORREF C_RED  = RGB(199, 87, 82);    // 0.78 0.34 0.32 - error only
     const COLORREF C_LIT  = RGB(214, 218, 226);  // the chosen display and its cable
+    const COLORREF C_GRN  = RGB(104, 176, 112);  // R329: OPTIMIZATION's state (QUALITY MAX / ON / FPS MAX)
 
     HINSTANCE g_hinst = nullptr;
     HWND g_main = nullptr, g_list = nullptr,
@@ -334,6 +335,10 @@ namespace
         { L"MULTI-DISPLAY: OFF", { L"MULTIMONITOR: N\u00C3O", L"MULTIMONITOR: NO", L"\u591A\u663E\u793A\u5668\uFF1A\u5173", L"\u30DE\u30EB\u30C1\u30C7\u30A3\u30B9\u30D7\u30EC\u30A4\uFF1A\u30AA\u30D5", L"\uB2E4\uC911 \uBAA8\uB2C8\uD130: \uB054" } },
         { L"RENAME", { L"RENOMEAR", L"RENOMBRAR", L"\u91CD\u547D\u540D", L"\u540D\u524D\u3092\u5909\u66F4", L"\uC774\uB984 \uBCC0\uACBD" } },
         { L"SAVE", { L"SALVAR", L"GUARDAR", L"\u4FDD\u5B58", L"\u4FDD\u5B58", L"\uC800\uC7A5" } },
+        // R329
+        { L"OPTIMIZATION", { L"OTIMIZA\u00C7\u00C3O", L"OPTIMIZACI\u00D3N", L"\u4F18\u5316", L"\u6700\u9069\u5316", L"\uCD5C\uC801\uD654" } },
+        { L"QUALITY MAX", { L"QUALIDADE M\u00C1XIMA", L"CALIDAD M\u00C1XIMA", L"\u753B\u8D28\u6700\u9AD8", L"\u753B\u8CEA\u6700\u5927", L"\uD654\uC9C8 \uCD5C\uB300" } },
+        { L"FPS MAX", { L"FPS M\u00C1XIMO", L"FPS M\u00C1XIMO", L"\u5E27\u7387\u6700\u9AD8", L"FPS \u6700\u5927", L"FPS \uCD5C\uB300" } },
         // R328: dialog captions (the same words as the buttons, in sentence case).
         { L"Copy files", { L"Copiar arquivos", L"Copiar archivos", L"\u590D\u5236\u6587\u4EF6", L"\u30D5\u30A1\u30A4\u30EB\u3092\u30B3\u30D4\u30FC", L"\uD30C\uC77C \uBCF5\uC0AC" } },
         { L"Diagnose", { L"Diagn\u00F3stico", L"Diagn\u00F3stico", L"\u8BCA\u65AD", L"\u8A3A\u65AD", L"\uC9C4\uB2E8" } },
@@ -1314,10 +1319,10 @@ namespace
         case ID_ADV_FG_THIN: kv.push_back({ "NRFrameFilter", "3" }); break;
         case ID_ADV_KEEP_M: kv.push_back({ "NRFrameKeep", std::to_string(a.keep > 2 ? a.keep - 1 : 2) }); break;
         case ID_ADV_KEEP_P: kv.push_back({ "NRFrameKeep", std::to_string(a.keep < 8 ? a.keep + 1 : 8) }); break;
-        case ID_ADV_SR_OFF: kv.push_back({ "SRUpscale", "0" }); break;
+        case ID_ADV_SR_OFF: kv.push_back({ "SRUpscale", "0" }); kv.push_back({ "NRScale", "0" }); break;   // R329: OPTIMIZATION off
         case ID_ADV_SR_ON:  kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, a.sr_native); break;
-        case ID_ADV_SR_NATIVE: adv_sr_mode_pairs(kv, a.sr_mode, true); break;
-        case ID_ADV_SR_EXP:    adv_sr_mode_pairs(kv, a.sr_mode, false); break;
+        case ID_ADV_SR_NATIVE: kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, true);  kv.push_back({ "NRScale", "0" }); break;   // R329
+        case ID_ADV_SR_EXP:    kv.push_back({ "SRUpscale", "1" }); adv_sr_mode_pairs(kv, a.sr_mode, false); kv.push_back({ "NRScale", "0" }); break;   // R329
         case ID_ADV_SRQ_Q: adv_sr_mode_pairs(kv, 2, a.sr_native); break;
         case ID_ADV_SRQ_B: adv_sr_mode_pairs(kv, 1, a.sr_native); break;
         case ID_ADV_SRQ_P: adv_sr_mode_pairs(kv, 0, a.sr_native); break;
@@ -1337,7 +1342,7 @@ namespace
         case ID_ADV_P2_LIGHT: kv.push_back({ "ResidualPass", "2" }); kv.push_back({ "ResidualScale", "0.75" }); kv.push_back({ "ResidualRender", "1" }); break;
         case ID_ADV_P2_FULL:  kv.push_back({ "ResidualPass", "0" }); break;
         // R321: the panel's "Pass 1 scale (NRS)" switch, same keys
-        case ID_ADV_NRS_ON:  kv.push_back({ "NRScale", "0.75" }); kv.push_back({ "NRScaleResolveDepth", "0" }); break;
+        case ID_ADV_NRS_ON:  kv.push_back({ "NRScale", "0.75" }); kv.push_back({ "NRScaleResolveDepth", "0" }); kv.push_back({ "SRUpscale", "0" }); break;   // R329: one at a time
         case ID_ADV_NRS_OFF: kv.push_back({ "NRScale", "0" }); break;
         default: return;
         }
@@ -1978,10 +1983,11 @@ namespace
     const adv_row_def k_adv_rows[] = {
         { L"TUNING", 2, AV_TEXT },     { L"MODEL STYLE", 3, AV_NONE },   { L"TONE", 2, AV_NUM },
         { L"STRUCTURE", 2, AV_NUM },   { L"SKIN", 2, AV_NUM },           { L"AUTO MASK", 2, AV_NONE },
-        { L"INTENSITY", 2, AV_NUM },   { L"PASSES", 2, AV_NONE },        { L"2ND PASS", 3, AV_NONE },   // R320
-        { L"PASS 1 SCALE (NRS)", 2, AV_NONE },   // R321
+        { L"INTENSITY", 2, AV_NUM },   { L"PASSES", 2, AV_NONE },
         { L"FRAME GENERATION", 4, AV_NONE },
-        { L"KEEP 1 GENERATED FRAME IN", 2, AV_NUM },  { L"DLSS ON GPU 1", 2, AV_NONE },  { L"UPSCALING", 2, AV_NONE },
+        // R329: the 2nd pass choice is the panel's Experimental setting only; NRS joins the
+        // upscaling choices in one row (one of them at a time), which replaces DLSS ON GPU 1.
+        { L"KEEP 1 GENERATED FRAME IN", 2, AV_NUM },  { L"OPTIMIZATION", 4, AV_NONE },
         { L"DLSS MODE", 3, AV_NONE },  { L"DLSS PRESET", 4, AV_NONE },   { L"CROP", 3, AV_NONE },
         { L"16-BIT COLOUR", 2, AV_NONE }, { L"16-BIT POWER", 2, AV_NUM },
     };
@@ -2001,8 +2007,8 @@ namespace
         case 3:  return { wf2(a.structure), a.tuning ? C_FG : C_DIM };
         case 4:  return { wf2(a.skin), a.tuning ? C_FG : C_DIM };
         case 6:  return { wf2(a.intensity), C_FG };
-        case 11: return { std::to_wstring(a.keep), (a.fg == 3) ? C_FG : C_DIM };   // R320 / R321: +2, the 2ND PASS and NRS rows
-        case 18: return { wf2(a.n16_power), a.n16 ? C_FG : C_DIM };
+        case 9:  return { std::to_wstring(a.keep), (a.fg == 3) ? C_FG : C_DIM };   // R329: rows renumbered
+        case 15: return { wf2(a.n16_power), a.n16 ? C_FG : C_DIM };
         default: return { L"", C_DIM };
         }
     }
@@ -2019,7 +2025,16 @@ namespace
         int y = g_adv_end + 6;
         y = guide_para(dc, PX, y, PW, L"FRAME GENERATION NEEDS MVEC=3 (THE GAME'S OWN VECTORS).", C_DIM);
         y = guide_para(dc, PX, y, PW, L"FRAME GENERATION SETTINGS MAY CRASH THE GAME AT STARTUP.", C_RED);
-        guide_para(dc, PX, y, PW, L"DLSS ON GPU 1: OFF IS THE BETTER PICTURE, ON IS CHEAPER.", C_DIM);
+        {   // R329: OPTIMIZATION's state in words and colour: OFF (red) QUALITY MAX (green), or ON FPS MAX (green)
+            const bool on = g_view.have_game && (g_adv.nrs || g_adv.sr);
+            const bool lit = g_view.have_game;
+            const std::wstring w0 = L"OPTIMIZATION", w1 = on ? L"ON" : L"OFF", w2 = on ? L"FPS MAX" : L"QUALITY MAX";
+            const int gap = 12;
+            int x = PX;
+            textf(dc, x, y + 4, PW, w0, 2, C_DIM);                                 x += text_w(w0, 2) + gap;
+            textf(dc, x, y + 4, PW - (x - PX), w1, 2, !lit ? C_DIM : on ? C_GRN : C_RED); x += text_w(w1, 2) + gap;
+            textf(dc, x, y + 4, PW - (x - PX), w2, 2, lit ? C_GRN : C_DIM);
+        }
     }
 
     // ---- the INSTALL page (the install guide; ID_TAB_GUIDE). Readable
@@ -2506,12 +2521,9 @@ namespace
             grp({ { L"OFF", ID_ADV_MASK_OFF }, { L"ON", ID_ADV_MASK_ON } }, ADV_VX);
             pm(ID_ADV_INT_M, ID_ADV_INT_P);
             grp({ { L"1", ID_ADV_PASSES_1 }, { L"2", ID_ADV_PASSES_2 } }, ADV_VX);
-            grp({ { L"MEDIUM", ID_ADV_P2_MED }, { L"LIGHT", ID_ADV_P2_LIGHT }, { L"FULL", ID_ADV_P2_FULL } }, ADV_VX);   // R320
-            grp({ { L"OFF", ID_ADV_NRS_OFF }, { L"ON", ID_ADV_NRS_ON } }, ADV_VX);   // R321
             grp({ { L"OFF", ID_ADV_FG_OFF }, { L"MAP ONLY", ID_ADV_FG_MAP }, { L"FIX VECTORS", ID_ADV_FG_FIX }, { L"FIX + THIN", ID_ADV_FG_THIN } }, ADV_VX);
             pm(ID_ADV_KEEP_M, ID_ADV_KEEP_P);
-            grp({ { L"OFF", ID_ADV_SR_OFF }, { L"ON", ID_ADV_SR_ON } }, ADV_VX);
-            grp({ { L"NATIVE UPSCALING", ID_ADV_SR_NATIVE }, { L"EXPERIMENTAL", ID_ADV_SR_EXP } }, ADV_VX);
+            grp({ { L"OFF", ID_ADV_SR_OFF }, { L"PASS 1 SCALE (NRS)", ID_ADV_NRS_ON }, { L"NATIVE UPSCALING", ID_ADV_SR_NATIVE }, { L"EXPERIMENTAL", ID_ADV_SR_EXP } }, ADV_VX);   // R329
             grp({ { L"QUALITY", ID_ADV_SRQ_Q }, { L"BALANCED", ID_ADV_SRQ_B }, { L"PERFORMANCE", ID_ADV_SRQ_P } }, ADV_VX);
             grp({ { L"TITLE DEFAULT", ID_ADV_PRESET_0 }, { L"K", ID_ADV_PRESET_K }, { L"L", ID_ADV_PRESET_L }, { L"M", ID_ADV_PRESET_M } }, ADV_VX);
             grp({ { L"OFF", ID_ADV_CROP_OFF }, { L"ON", ID_ADV_CROP_ON }, { L"AUTO CROP", ID_ADV_CROP_AUTO } }, ADV_VX);
@@ -2566,11 +2578,9 @@ namespace
             g_active_ids.push_back(a.style == 0 ? ID_ADV_STYLE_A : a.style == 1 ? ID_ADV_STYLE_B : ID_ADV_STYLE_C);
             g_active_ids.push_back(a.mask ? ID_ADV_MASK_ON : ID_ADV_MASK_OFF);
             g_active_ids.push_back(a.passes == 2 ? ID_ADV_PASSES_2 : ID_ADV_PASSES_1);
-            g_active_ids.push_back(a.pass2 == 0 ? ID_ADV_P2_MED : a.pass2 == 1 ? ID_ADV_P2_LIGHT : ID_ADV_P2_FULL);   // R320
-            g_active_ids.push_back(a.nrs ? ID_ADV_NRS_ON : ID_ADV_NRS_OFF);   // R321
             g_active_ids.push_back(a.fg == 0 ? ID_ADV_FG_OFF : a.fg == 1 ? ID_ADV_FG_MAP : a.fg == 2 ? ID_ADV_FG_FIX : ID_ADV_FG_THIN);
-            g_active_ids.push_back(a.sr ? ID_ADV_SR_ON : ID_ADV_SR_OFF);
-            g_active_ids.push_back(a.sr_native ? ID_ADV_SR_NATIVE : ID_ADV_SR_EXP);
+            // R329: one choice in OPTIMIZATION - NRS, an upscaling option, or off
+            g_active_ids.push_back(a.nrs ? ID_ADV_NRS_ON : !a.sr ? ID_ADV_SR_OFF : a.sr_native ? ID_ADV_SR_NATIVE : ID_ADV_SR_EXP);
             g_active_ids.push_back(a.sr_mode == 2 ? ID_ADV_SRQ_Q : a.sr_mode == 1 ? ID_ADV_SRQ_B : ID_ADV_SRQ_P);
             g_active_ids.push_back(a.sr_preset == 11 ? ID_ADV_PRESET_K : a.sr_preset == 12 ? ID_ADV_PRESET_L : a.sr_preset == 13 ? ID_ADV_PRESET_M : ID_ADV_PRESET_0);
             g_active_ids.push_back(a.crop == 0 ? ID_ADV_CROP_OFF : a.crop == 1 ? ID_ADV_CROP_ON : ID_ADV_CROP_AUTO);
