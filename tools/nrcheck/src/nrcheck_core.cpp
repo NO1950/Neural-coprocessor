@@ -630,7 +630,7 @@ int nrbench_run2(int neural_index, int other_index, const wchar_t *snippet_path,
     {
         HMODULE self = nullptr;
         GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                           (LPCWSTR)&nrbench_run, &self);
+                           (LPCWSTR)&nrbench_run2, &self);   // R320: any function of this DLL names it; nrbench_run is defined below
         GetModuleFileNameW(self, n.data_path, MAX_PATH);
         wchar_t *sl = wcsrchr(n.data_path, L'\\');
         if (sl != nullptr) sl[1] = L'\0';
