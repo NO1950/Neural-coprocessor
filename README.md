@@ -28,6 +28,8 @@ The Super Resolution options in the panel reduce that cost. They create a second
 
 Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu.ini` files [here](https://github.com/maohgad-web/Neural-coprocessor/tree/main/reference) - [DLSS Quality](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuQUALITY.ini) and [DLSS Performance](https://github.com/maohgad-web/Neural-coprocessor/blob/main/reference/mgpuPERFORMANCE.ini).
 
+**Pass 1 scale (NRS)** also reduces the cost, under Experimental settings in the panel, or set `NRScale=0.75` and `NRScaleResolveDepth=0` in `mgpu.ini`. Useful at 3440x1440 or 3840x2160.
+
 * * *
 
 ## New in 0.4.0
@@ -42,7 +44,7 @@ Turn it on in the panel, or edit `mgpu.ini` yourself. You can find example `mgpu
 
 **Games without DLSS.** The first launch finds the right motion vectors faster and more reliably.
 
-**Launcher.** The new settings are on the Options page. Copy files replaces an old `mgpu.ini` and keeps your Dcomp settings.
+**Launcher.** A new Optimization row on the Options page: NRS, Native upscaling or Experimental upscaling, to compare against Off. Copy files replaces an old `mgpu.ini`, keeps your Dcomp settings, and can keep a backup.
 
 Take the new `mgpu.ini`.
 
