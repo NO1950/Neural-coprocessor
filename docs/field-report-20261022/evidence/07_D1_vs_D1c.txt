@@ -1,0 +1,28 @@
+# D1 (feeder OFF) vs D1c (feeder ON, SAME tap MV path) -- the single-variable sharpness A/B
+
+* D1  operator: "this frame, the knob graduations look better than the last few rounds; shadow flicker about the same."
+* D1b operator: "also feels blurrier" -- VOID: R105 had overridden the tap UV scale (scale_ngx=1.000 instead of 3840x2160).
+* D1c operator: "D1c also feels blurrier" -- valid: Calib=0 kept the learned UV scale; same MV path, same keys, only the feeder differs.
+
+## D1 install manifest
+
+installed 2026-10-22 21:46
+feeder OFF (dlss5-feed.addon64.off-d1)
+bridge sha16 AFDC12D9471DF556 (0.4.0 + R330/R331/R332)
+MV path: OWN TAP (MvecFromEval=0, MVecTap=1, MVecExtractOff=0, MVecSource=0)
+preset: MGPU_DepthTap only
+Depth=1 DepthTransport=2 NRScale=0.66 PerfPrefetchMax=2 MVecArmWait=1800 TemporalDiag=1
+purpose D1: wean off feeder/Lumenite; does FC6 still write a usable velocity buffer with AA off?
+check: [R71] candidates, [R75] non-zero, [R78] carried, NR running
+rollback: before_install (4 files) + rename .off-d1 back
+
+## D1c install manifest
+
+installed 2026-10-22 22:07
+feeder ON
+bridge MV: own tap (MvecFromEval=0 MVecTap=1 MVecExtractOff=0)
+Calib=0: the calibrator is OFF so R105 cannot override the learned UV scale (that is what voided D1b: scale_ngx=1.000 instead of 3840x2160)
+everything else identical to D1 (NRScale 0.66, Max 2, Depth 1, MVecArmWait 1800)
+purpose: isolate feeder presence (its own NR pass on the colour) with the MV units intact
+judge: KNOB SHARPNESS ONLY vs D1
+rollback: before_install\\mgpu.ini.bak + feeder off

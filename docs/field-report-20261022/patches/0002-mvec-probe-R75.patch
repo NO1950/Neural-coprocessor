@@ -1,0 +1,377 @@
+﻿diff --git a/src/probe.cpp b/src/probe.cpp
+index 43ba804..096dcca 100644
+--- a/src/probe.cpp
++++ b/src/probe.cpp
+@@ -197,6 +197,23 @@ std::atomic<unsigned long long> g_r315_tail_copies{0};
+ std::atomic<unsigned long long> g_mvec_skips;      // already done this frame
+ unsigned long long g_mvec_last_frame = ~0ull;
+ 
++// R320 (B3). The resource behind MVecTexName's variable, published for this
++// frame, or 0; and the variable NAME from mgpu.ini (empty = the key is absent).
++// Declared HERE rather than beside the rest of the R320 block (which sits with
++// the ini read, ~1100 lines later) because three paths far above it have to
++// stand down while the key is set:
++//
++//   the census dump      it re-writes g_mvec_src every MetaProbeLogSeconds from
++//                        a ranking this source is not a member of
++//   set_mvec_override    the calibrator / SLTags publish a resource the GAME
++//                        owns; the key exists to transport one it does not
++//   eval_copy_mode       the calibrator's evaluate copy would deliver the game's
++//                        buffer on the same frames, with no key to say so
++//
++// Same reason R76 put g_semC_res above every path that can evict.
++std::atomic<unsigned long long> g_mvtex_res{0};
++char     g_mvtex_name[64] = {};     // empty = MVecTexName is absent
++
+ // The semantic lane's chosen depth resource. Declared HERE rather than beside
+ // the rest of the semantic lane because on_destroy_resource must clear it, and
+ // that runs far earlier in this file. R76.
+@@ -767,6 +784,11 @@ void mv_copy(ID3D12GraphicsCommandList *gl, ID3D12Resource *src)
+     if (FAILED(src->GetDevice(IID_PPV_ARGS(&rdev))) || rdev == nullptr) return;
+ 
+     const D3D12_RESOURCE_DESC sd0 = src->GetDesc();
++    // R321: the probe labels what it actually copied, so a [R75] line can never
++    // describe one buffer and measure another.
++    g_mv_w.store((unsigned)sd0.Width, std::memory_order_relaxed);
++    g_mv_h.store((unsigned)sd0.Height, std::memory_order_relaxed);
++    g_mv_fmt.store((unsigned)sd0.Format, std::memory_order_relaxed);
+     D3D12_RESOURCE_DESC sd = sd0;
+     sd.Width = MV_PATCH; sd.Height = MV_PATCH;
+     sd.MipLevels = 1; sd.DepthOrArraySize = 1;
+@@ -2367,6 +2389,12 @@ void dump()
+             // publishes nothing (bounded by that module), so the arm does not settle
+             // on a smaller buffer first. Once the stream produces, the pick is its own.
+             if (g_mvec_defer.load(std::memory_order_relaxed) && !g_pick_locked.load(std::memory_order_relaxed)) pick = 0;
++            // R320 (B3): a source asked for BY NAME outranks every rule above -
++            // the ranking, MVecCandidate, the lock, the defer. By construction it
++            // is not in the census at all (the game did not create it), so every
++            // test above would refuse it and the dump would overwrite the per-frame
++            // lane's publication on its next pass.
++            if (const unsigned long long tex = g_mvtex_res.load(std::memory_order_relaxed)) pick = tex;
+             g_mvec_src.store(pick, std::memory_order_relaxed);
+         }
+         int w = snprintf(line, sizeof line,
+@@ -2560,7 +2588,30 @@ void dump()
+         if (g_mv_mode.load(std::memory_order_relaxed) != 0)
+         {
+             const unsigned want = g_mv_index.load(std::memory_order_relaxed);
+-            if (want < k)
++            // R320b (B3): with a named source live, the CONTENT probe reads THAT
++            // resource instead of a census member. It is the only field whose value
++            // this rig can set, which is what turns [R75] from an observation into a
++            // test: "FIELD_X=2000 in the .fx" and "2000 in the texture the transport
++            // copies" become two different facts, and only the second one explains a
++            // picture. W/H/FMT are the lane's, stored when it published, so the line
++            // labels what was actually read.
++            if (const unsigned long long tex = g_mvtex_res.load(std::memory_order_relaxed))
++            {
++                g_mv_target.store(tex, std::memory_order_relaxed);
++            }
++            // R321: with NO named source, the probe reads the resource the
++            // transport ACTUALLY publishes - not a census index. The two are
++            // different buffers on FC6: the transport carries the calibrator's
++            // 3840x2160 MV while MVecProbeIndex=0 pointed at an empty 1920x1080
++            // candidate, so [R75] read 0.0000 for 76 of 76 samples and the
++            // "the field is empty" reading was about a buffer nobody copies.
++            // Reading g_mvec_src makes the probe answer the only question that
++            // matters: is the field THE MODEL GETS a real velocity field?
++            else if (const unsigned long long src = g_mvec_src.load(std::memory_order_relaxed))
++            {
++                g_mv_target.store(src, std::memory_order_relaxed);
++            }
++            else if (want < k)
+             {
+                 const cand &t = g_mvec.t[idx[want]];
+                 g_mv_target.store(t.handle, std::memory_order_relaxed);
+@@ -3048,6 +3099,12 @@ int jitter_mode()
+ 
+ int eval_copy_mode()
+ {
++    // R320 (B3): with MVecTexName set, the evaluate copy would deliver the GAME's
++    // vector buffer on exactly the frames this lane is trying to fill with a
++    // resource the game does not own - two sources, one slot, and nothing in the
++    // log to say which was copied. Reported as 0 so the calibrator never arms it;
++    // the key is absent in every other run and this returns what it always did.
++    if (g_mvtex_name[0] != '\0') return 0;
+     return g_evalcopy.load(std::memory_order_relaxed);
+ }
+ 
+@@ -3070,6 +3127,29 @@ void r315_tail_copy(void *command_list_ptr)
+     const reshade::api::resource r = { want };
+     cl->barrier(r, reshade::api::resource_usage::shader_resource, reshade::api::resource_usage::copy_source);
+     g_mvec_hook(reinterpret_cast<void *>(cl->get_native()), want);
++
++    // ---- R322: THE CONTENT PROBE RIDES THE TAIL TOO ----
++    //
++    // [R75] has been blind for as long as the tail has been the delivering route:
++    // the probe's copy lived inside fire_mvec_hook, and on FC6 the tail copy
++    // (phase=TAIL, tail delivered=30837 against barrier fired=0) never goes
++    // through it. So the probe reported copies=0/reads=0 - and every "the field
++    // is empty" reading (R1's cov=0%, and the 129/129 zero-field samples of the
++    // 2026-10-18 J2 run) was about a buffer nobody measured, not about the field
++    // the model gets. Same window, same state, same box maths as the hook path.
++    // R322b: probe WHAT THE TAIL IS ABOUT TO COPY - no equality test against the
++    // dump's target. The dump stores the handle it published, the calibrator
++    // overrides g_mvec_src every frame, and on FC6 the two are different handles
++    // often enough that a "target == want" gate skipped all 39,909 tail copies of
++    // the 21:38 run (copies=0 for 234 dumps). The tail's `want` IS the field the
++    // model receives; that is the only thing worth measuring.
++    if (g_mv_mode.load(std::memory_order_relaxed) != 0 && g_mv_state == 0)
++    {
++        g_mv_target.store(want, std::memory_order_relaxed);
++        mv_copy(reinterpret_cast<ID3D12GraphicsCommandList *>(cl->get_native()),
++                reinterpret_cast<ID3D12Resource *>(static_cast<uintptr_t>(want)));
++    }
++
+     cl->barrier(r, reshade::api::resource_usage::copy_source, reshade::api::resource_usage::shader_resource);
+     g_r315_tail_copies.fetch_add(1, std::memory_order_relaxed);
+ }
+@@ -3095,9 +3175,215 @@ int sf_path_mode()
+ // costs one relaxed store.
+ void set_mvec_override(unsigned long long handle)
+ {
++    // R320 (B3): every caller of this publishes a resource the GAME owns - the
++    // calibrator's evaluate table, Streamline's tag. With MVecTexName set the
++    // whole point is to transport one the game does NOT own, so the override
++    // stands down: otherwise it would win back the slot one frame after this
++    // file's named source published into it, and the run would silently be a
++    // normal one. Zero is still ignored, as before.
++    if (g_mvtex_name[0] != '\0') return;
+     if (handle != 0) g_mvec_src.store(handle, std::memory_order_relaxed);
+ }
+ 
++// ---- R320 (B3): A VELOCITY SOURCE NAMED BY ITS TEXTURE VARIABLE ----
++//
++// WHAT THE CENSUS CANNOT SEE. Everything above acquires by watching the GAME:
++// init_resource gives a handle, the bind events give a size and a format, the
++// ranking picks one, and the transport copies it. A resource the game never
++// created is invisible to all of it - and on 2026-10-18 three routes that tried
++// to supply a field from outside were measured dead: B1 (a .fx writer), B4 (an
++// add-on creating the texture itself, by two different creation paths), B5 (a
++// shared texture handed to the feeder). The census holds what the game creates
++// and nothing else.
++//
++// THE OTHER QUESTION. This file already asks the ReShade API a different one,
++// for DEPTH: not "what does the game render into" but "what is bound to THIS
++// TEXTURE VARIABLE right now". The pinned header answers it in four calls:
++//
++//   find_texture_variable(effect_name, variable_name)   -> handle, or 0
++//   get_texture_binding(variable, &srv, &srv_srgb)      -> the view bound this frame
++//   device::get_resource_from_view(srv)                 -> the resource behind it
++//   device::get_resource_desc(resource)                 -> size and format
++//
++// So a texture the add-on can NAME is a texture the transport can copy, whoever
++// created it. That is the whole of B3: no census membership, no ranking, no bind
++// counting - one name, read from mgpu.ini, and the two tests the census applies
++// (motion-vector format, scene size band) so a wrong name cannot smuggle a wrong
++// texture into the model.
++//
++// MVecTexName=<variable name> in mgpu.ini. ABSENT = OFF: no lookup, no binding
++// read, no barrier, no log line, nothing. Set, it wins over every other source
++// rule - the ranking, MVecCandidate, the defer, the pick lock - because it is the
++// only one that was asked for by name.
++//
++// THE STATE ASSUMPTION IS shader_resource, AND IT IS AN ASSUMPTION. The binding
++// handed over is an SRV, and by finish_effects the pass that wrote the texture has
++// transitioned it for the next reader. That is the same assumption MVecTap=1 makes
++// (R277) and the same transition arm C already issues on ReShade's own depth
++// (R55). A wrong assumption is undefined behaviour, not an error that can be
++// caught - so the copy count in [R78] and the content probe in [R257] are the
++// judges of this lane, not this comment.
++//
++// SELF-HEALING (the R63 pattern): an unbound frame clears the variable handle and
++// the next frame re-resolves it, and the handle is re-resolved every
++// R320_RESOLVE_FRAMES anyway so an effect reload cannot leave a stale one behind.
++const unsigned R320_RESOLVE_FRAMES = 240;
++
++reshade::api::effect_texture_variable g_mvtex_var = {};
++unsigned long long g_mvtex_at = ~0ull;             // frame of the last resolve
++unsigned long long g_mvtex_hits = 0, g_mvtex_miss = 0;
++unsigned long long g_mvtex_said_res = 0;           // last resource published and reported
++
++// One state, so "the same name bound to a different resource" is a log line
++// rather than silence; and one per refusal reason, so a wrong name is reported
++// once instead of every frame.
++int g_mvtex_said_why = 0;
++
++// From mode_from_ini. Empty or absent name turns the lane off completely - the
++// per-frame path below is one compare and a return.
++void mvtex_set_name(const char *name)
++{
++    g_mvtex_name[0] = '\0';
++    if (name != nullptr)
++    {
++        size_t i = 0;
++        for (; i + 1u < sizeof g_mvtex_name && name[i] != '\0' &&
++               name[i] != '\r' && name[i] != '\n' && name[i] != ' ' && name[i] != '\t'; ++i)
++            g_mvtex_name[i] = name[i];
++        g_mvtex_name[i] = '\0';
++    }
++    g_mvtex_var = reshade::api::effect_texture_variable{};
++    g_mvtex_res.store(0ull, std::memory_order_relaxed);
++    g_mvtex_at = ~0ull;
++    g_mvtex_said_res = 0ull;
++    g_mvtex_said_why = 0;
++}
++
++// Once per frame, on the game's render thread, from note_effects - the same place
++// and for the same reason as the R63 depth block: Depth=1 must not require
++// MetaProbe, and neither must MVecTexName.
++void mvtex_tick(reshade::api::effect_runtime *rt, reshade::api::command_list *cl)
++{
++    if (g_mvtex_name[0] == '\0' || rt == nullptr) return;
++
++    const unsigned long long fr = g_frames.load(std::memory_order_relaxed);
++    if (g_mvtex_var.handle == 0 || fr - g_mvtex_at >= R320_RESOLVE_FRAMES)
++    {
++        g_mvtex_at = fr;
++        g_mvtex_var = rt->find_texture_variable(nullptr, g_mvtex_name);
++        if (g_mvtex_var.handle == 0)
++        {
++            if (g_mvtex_said_why != -1)
++            {
++                g_mvtex_said_why = -1;
++                char l[300];
++                snprintf(l, sizeof l,
++                         "[MGPU][R320] MVecTexName=\"%s\": no such texture variable in any loaded effect. "
++                         "Re-resolving every %u frames; nothing is transported from this key until it appears.",
++                         g_mvtex_name, R320_RESOLVE_FRAMES);
++                mgpu::diag::warn(l);
++            }
++            return;
++        }
++    }
++
++    // ---- what is bound to it THIS frame ----
++    unsigned long long h = 0;
++    unsigned w = 0, hh = 0, fmt = 0;
++    {
++        reshade::api::resource_view srv = {}, srgb = {};
++        rt->get_texture_binding(g_mvtex_var, &srv, &srgb);
++        if (srv.handle == 0)
++        {
++            // R63's self-heal: unbound this frame is not a handle to keep.
++            g_mvtex_var = reshade::api::effect_texture_variable{};
++            ++g_mvtex_miss;
++        }
++        else if (reshade::api::device *dv = rt->get_device())
++        {
++            const reshade::api::resource r = dv->get_resource_from_view(srv);
++            if (r.handle != 0)
++            {
++                const reshade::api::resource_desc rd = dv->get_resource_desc(r);
++                h = r.handle;
++                w = rd.texture.width;
++                hh = rd.texture.height;
++                fmt = static_cast<unsigned>(rd.texture.format);
++            }
++        }
++    }
++
++    // The same two tests the census applies. A refusal is reported once per
++    // reason: what is bound here is a name the user typed, and a mistyped name
++    // usually lands on a perfectly valid texture of the wrong kind.
++    int why = 0;
++    if (h == 0) why = 3;                       // nothing bound right now
++    else if (!is_mvec_format(fmt)) why = 1;    // not two-channel motion-vector data
++    else if (!in_scene_band(w, hh)) why = 2;   // not scene-sized
++
++    if (why == 0)
++    {
++        ++g_mvtex_hits;
++        g_mvtex_res.store(h, std::memory_order_relaxed);
++        // R320b: the labels [R75] prints for the resource it read. Stored here
++        // because this lane is the only place that knows them, and a probe line
++        // that labels a 3840x2160 read with another buffer's size is how a
++        // correct measurement gets read as a wrong one.
++        g_mv_w.store(w, std::memory_order_relaxed);
++        g_mv_h.store(hh, std::memory_order_relaxed);
++        g_mv_fmt.store(fmt, std::memory_order_relaxed);
++        // Publish as THE source BEFORE the hook fires: fire_mvec_hook copies only
++        // the resource this file has published, and this is the only publisher
++        // that was asked for by name.
++        g_mvec_src.store(h, std::memory_order_relaxed);
++        if (h != g_mvtex_said_res)
++        {
++            g_mvtex_said_res = h;
++            g_mvtex_said_why = 0;
++            char l[400];
++            snprintf(l, sizeof l,
++                     "[MGPU][R320] TEX SOURCE: variable \"%s\" is bound to 0x%016llX (%ux%u %s) - published as the "
++                     "velocity source, winning over the census. The copy is issued at finish_effects with state ASSUMED "
++                     "shader_resource; [R78]'s copies counter and [R257]'s content probe are what say whether it arrived.",
++                     g_mvtex_name, h, w, hh, fmt_name(fmt));
++            mgpu::diag::info(l);
++        }
++        if (cl != nullptr)
++        {
++            // One copy per frame is fire_mvec_hook's own guarantee (g_mvec_last_frame).
++            fire_mvec_hook(cl, h, reshade::api::resource_usage::shader_resource);
++        }
++    }
++    else
++    {
++        g_mvtex_res.store(0ull, std::memory_order_relaxed);
++        // Give the slot back ONLY if it is still ours: the R101 calibrator may have
++        // published the game's own DLSS vector buffer in the meantime, and that one
++        // is authoritative.
++        const unsigned long long pub = g_mvec_src.load(std::memory_order_relaxed);
++        if (g_mvtex_said_res != 0 && pub == g_mvtex_said_res)
++            g_mvec_src.store(0ull, std::memory_order_relaxed);
++        g_mvtex_said_res = 0ull;
++        if (why != g_mvtex_said_why)
++        {
++            g_mvtex_said_why = why;
++            char l[340];
++            if (why == 3)
++                snprintf(l, sizeof l,
++                         "[MGPU][R320] TEX SOURCE idle: variable \"%s\" exists but nothing is bound to it this frame. "
++                         "Waiting; no other source rule is touched while the key is set.",
++                         g_mvtex_name);
++            else
++                snprintf(l, sizeof l,
++                         "[MGPU][R320] TEX SOURCE refused: variable \"%s\" is bound to 0x%016llX (%ux%u %s) - %s. "
++                         "Nothing is transported from this variable until it satisfies both tests.",
++                         g_mvtex_name, h, w, hh, fmt_name(fmt),
++                         (why == 1) ? "not a two-channel motion-vector format" : "not inside the scene size band");
++            mgpu::diag::warn(l);
++        }
++    }
++}
++
+ mode mode_from_ini()
+ {
+     static char buf[mgpu::config::MAX_BYTES + 1];
+@@ -3246,6 +3532,12 @@ mode mode_from_ini()
+         const int pn = (k4 != nullptr) ? atoi(k4) : 0;
+         g_mvec_pick_n.store((pn >= 0 && pn < 8) ? (unsigned)pn : 0u, std::memory_order_relaxed);
+     }
++    {
++        // R320 (B3): MVecTexName=<texture variable name>. The one acquisition
++        // route that does not go through the census - see the block above this
++        // function. Absent = the lane is off and costs one compare per frame.
++        mvtex_set_name(mgpu::config::find(buf, strlen(buf), "MVecTexName"));
++    }
+ 
+     const char *k = mgpu::config::find(buf, strlen(buf), "MetaProbeLogSeconds");
+     if (k != nullptr)
+@@ -3392,6 +3684,19 @@ void note_effects(void *effect_runtime_ptr, void *command_list_ptr)
+         }
+     }
+ 
++    // ---- R320 (B3): the named texture variable, resolved EVERY frame and BEFORE
++    // the probe-mode gate - the same place and the same reason as the depth block
++    // above. MVecTexName=1 must not require MetaProbe=1 any more than Depth=1 does:
++    // with the probe off this is still the transport's source. One compare and a
++    // return when the key is absent. ----
++    if (g_mvtex_name[0] != '\0')
++    {
++        reshade::api::effect_runtime *rt3 =
++            static_cast<reshade::api::effect_runtime *>(effect_runtime_ptr);
++        if (rt3 != nullptr)
++            mvtex_tick(rt3, static_cast<reshade::api::command_list *>(command_list_ptr));
++    }
++
+     if (g_mode.load(std::memory_order_relaxed) == 0) return;
+ 
+     // ---- R55: arm C. Mode 3 only. ----

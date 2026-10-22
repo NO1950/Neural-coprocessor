@@ -1,0 +1,7 @@
+# The feeder delivers its own NR result into the game backbuffer every frame (the second filter)
+# source: C:\Users\Administrator\Desktop\dlss5\30_experiments\FC6\runs\20261022-D1c_feederCalibOff\dlss5-feed.log
+
+21:56:28.605  [feed] feature ready: 3840x2160 DLAA, flags=74 (SDR MVLowRes DepthInverted AutoExposure), color R8G8B8A8_UNORM -> output R8G8B8A8_UNORM, depth R32_FLOAT (reversed), mv R16G16_FLOAT
+21:56:29.922  [feed] feature ready: 3840x2160 DLAA, flags=74 (SDR MVLowRes DepthInverted AutoExposure), color R8G8B8A8_UNORM -> output R8G8B8A8_UNORM, depth R32_FLOAT (reversed), mv R16G16_FLOAT
+21:56:28.606  [feed] frame 1 delivered (3840x2160, reset=1, same-device)
+21:56:40.860  [feed] frame 1800 delivered (3840x2160, reset=0, same-device)
