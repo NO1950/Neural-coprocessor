@@ -10095,6 +10095,15 @@ namespace
         // never showed this. Nothing required the answer to be STABLE.
         unsigned long long mvec_seen_handle = 0;
         unsigned long long mvec_stable = 0;
+        // R330 (2026-10-22): the startup-contract guard and the lane verdict. See the arm gate and
+        // the [R78] report for why they exist.
+        bool   mvec_small_said = false;   // R330: the "publisher is at a loading-screen extent" line, once
+        bool   mvec_dead_said = false;    // R330: the "this session carries no vectors" line, once
+        unsigned long long mvec_src_last = 0;   // R331: the published handle the lane is currently carrying
+        std::atomic<unsigned long long> mvec_src_epoch{0};   // R331: bumped once per confirmed source change
+        unsigned long long mvec_src_epoch_seen = 0;          // R331: consumer-side; only the consumer thread writes it
+        unsigned long long mvec_src_cand = 0;   // R331: the candidate new handle ...
+        unsigned mvec_src_cand_n = 0;           // ... and how many consecutive frames it has held (hysteresis)
         unsigned long long mvec_unpacks = 0;
         unsigned long long mvec_bound = 0, mvec_skipped = 0;
         unsigned long long mvec_seen_valid = 0, mvec_seen_invalid = 0;
@@ -10321,6 +10330,13 @@ namespace
         int depth_inverted = 1;
         float mvec_dx = 0.0f, mvec_dy = 0.0f;
         float mvec_scale_x = 1.0f, mvec_scale_y = 1.0f;
+        // R332 (2026-10-22): a multiplier ON TOP of whatever R105 resolves. R105 replaced the
+        // ini's typed scale with the game's own table value on any title where the calibrator
+        // resolves, which makes MVecScaleX/Y untestable there: on Far Cry 6 the table says
+        // 1.0000 and an ini of 1.0300 was silently discarded ([R105] said so, the evaluate
+        // still got 1.0). A units/space error is the one mechanism that produces a smear which
+        // grows with speed and does NOT respond to frame age, so it has to be testable.
+        float mvec_scale_mul = 1.0f;
         bool  mvec_dirty = true;
         // R290 (0.3.1): the depth hold's bound (DepthHoldMax), read at stream_request.
         unsigned long long depth_hold_max_ms = 180000ull;   // 0 = no bound (the 0.2.4 / 0.3.0 hold)
@@ -19191,6 +19207,21 @@ void stream_request()
     s.mvec_dy      = ini_read_named_float("MVecDY", 0.0f);
     s.mvec_scale_x = ini_read_named_float("MVecScaleX", 1.0f);
     s.mvec_scale_y = ini_read_named_float("MVecScaleY", 1.0f);
+    // R332: the units test that R105 made impossible. Clamped so a typo cannot hand NGX a
+    // scale that turns a reprojection into a teleport.
+    s.mvec_scale_mul = ini_read_named_float("MVecScaleMul", 1.0f);
+    if (!(s.mvec_scale_mul > 0.25f && s.mvec_scale_mul < 4.0f)) s.mvec_scale_mul = 1.0f;
+    if (s.mvec_scale_mul != 1.0f)
+    {
+        char ml[600];
+        snprintf(ml, sizeof ml,
+                 "[MGPU][R332] MVecScaleMul=%.4f: multiplied on top of whatever R105 resolves (the game's own "
+                 "table wins over MVecScaleX/Y whenever the calibrator resolves). This is the units test: a "
+                 "wrong vector space gives a smear that grows with speed and does not answer to frame age. "
+                 "Take the picture verdict from this run against a MVecScaleMul=1.0000 run at the same NRScale.",
+                 (double)s.mvec_scale_mul);
+        mgpu::diag::info(ml);
+    }
     s.mvec_dirty   = true;
     {
         const int cqm = ini_read_copy_queue();
@@ -20318,6 +20349,31 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // periodic report name the resource the lane was looking at when it went
     // quiet, without this file ever including the probe's header.
     s.mvec_pub_handle.store(mvec_handle, std::memory_order_relaxed);
+    // R331 (2026-10-22). THE PROVIDER RULE, taken from GITC-Uplift: a source that changes identity is
+    // a different history. Uplift forces a reset_hint the moment its MV provider changes; our lane had
+    // no equivalent, so a contract recreated around a menu or a device reset was reprojected against a
+    // history built from the previous buffer. Twelve consecutive frames of the new handle are required
+    // before it counts, because some titles alternate pool members frame to frame and a reset on each
+    // of those would remove history entirely.
+    if (mvec_handle != 0ull)
+    {
+        if (s.mvec_src_last == 0ull) s.mvec_src_last = mvec_handle;
+        else if (mvec_handle == s.mvec_src_last) { s.mvec_src_cand = 0ull; s.mvec_src_cand_n = 0u; }
+        else
+        {
+            if (s.mvec_src_cand == mvec_handle) ++s.mvec_src_cand_n;
+            else { s.mvec_src_cand = mvec_handle; s.mvec_src_cand_n = 1u; }
+            if (s.mvec_src_cand_n >= 12u)
+            {
+                mgpu::diag::info("[MGPU][R331] MVEC SOURCE CHANGED: the publisher now hands a different buffer. "
+                                 "One NR reset is owed so history is not reprojected across the change "
+                                 "(GITC-Uplift's provider rule; 12-frame hysteresis against pool alternation).");
+                s.mvec_src_last = mvec_handle;
+                s.mvec_src_cand = 0ull; s.mvec_src_cand_n = 0u;
+                s.mvec_src_epoch.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        }
+    }
     // R324 (MVecBarrierSource=2): the re-judge, AT THE EVENT. The judge's verdict (TAIL / EVALUATE) was
     // proven on one published buffer. When the game publishes another (a rebuild around a menu on
     // Cyberpunk 2026-10-16, a pool member on Dragon Sword, a feature recreate on Starfield), the window
@@ -20509,6 +20565,53 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             else { s.mvec_seen_handle = mvec_handle; s.mvec_stable = 1; }
         }
         const unsigned long long STABLE_NEED = 240ull;   // ~4 s at 60 fps
+        // R330 (2026-10-22). THE STARTUP CONTRACT TRAP, measured on Far Cry 6.
+        //
+        // Run 20261021-B1_nrs050: the game was still at 1280x720 when feeder built its DLAA
+        // contract, that handle then stayed identical for STABLE_NEED frames, the arm sized the
+        // velocity region 1280x720 against a 3840x2160 scene, and every frame after the game
+        // recreated its device at 4K was size-rejected. [R78] ended the run at
+        //   region 1280x720 ... copies=0 missing=12008 size-rejected=23892 ... 0.0% of sealed
+        //   frames carried vectors
+        // and a picture verdict was still taken from that session. R99 fixed the case where the
+        // handle MOVES; this is the case where it does not move, it is simply the wrong buffer.
+        //
+        // A velocity target at or above the colour extent is the normal shape here (R70: display
+        // extent while colour renders at 65%). A source under a quarter of the scene is a
+        // loading-screen buffer, so hold for a scene-extent one - bounded, and take the small one
+        // anyway when the bound runs out, so a title whose MV is honestly low-resolution pays ten
+        // seconds once instead of reading as broken forever. MVecArmPlausible=0 restores the old arm.
+        const bool arm_plausible = ui_ini_read("MVecArmPlausible", 1) != 0;
+        bool mv_plausible = true;
+        unsigned mv_pw = 0u, mv_ph = 0u, sc_w = 0u, sc_h = 0u;
+        if (mvec_handle != 0ull && src != nullptr)
+        {
+            const D3D12_RESOURCE_DESC mdp =
+                reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)mvec_handle)->GetDesc();
+            const D3D12_RESOURCE_DESC sdp = src->GetDesc();
+            mv_pw = (unsigned)mdp.Width; mv_ph = (unsigned)mdp.Height;
+            sc_w = (unsigned)sdp.Width;  sc_h = (unsigned)sdp.Height;
+            if (sc_w != 0u && sc_h != 0u && mv_pw != 0u && mv_ph != 0u)
+                mv_plausible = ((unsigned long long)mv_pw * (unsigned long long)mv_ph * 4ull >=
+                                (unsigned long long)sc_w * (unsigned long long)sc_h);
+        }
+        unsigned long long mv_hold = (unsigned long long)ui_ini_read("MVecArmWait", 900);   // R330: frames to wait for a scene-extent source
+        if (mv_hold < 120ull) mv_hold = 120ull;
+        if (mv_hold > 3600ull) mv_hold = 3600ull;
+        const unsigned long long MV_PLAUSIBLE_HOLD = mv_hold;
+        const bool mv_small_hold = arm_plausible && !mv_plausible && s.mvec_arm_waits < MV_PLAUSIBLE_HOLD;
+        if (arm_plausible && !mv_plausible && !s.mvec_small_said)
+        {
+            s.mvec_small_said = true;
+            char pl[720];
+            snprintf(pl, sizeof pl,
+                     "[MGPU][R330] MVEC arm withheld: the publisher's buffer is %ux%u, under a quarter of the "
+                     "scene %ux%u. That is the shape of a loading-screen contract (Far Cry 6 armed 1280x720 "
+                     "against 3840x2160 on 2026-10-21 and the whole run carried 0.0%% of vectors). Holding for "
+                     "up to %llu frame(s) for a scene-extent source; MVecArmPlausible=0 restores the old arm.",
+                     mv_pw, mv_ph, sc_w, sc_h, MV_PLAUSIBLE_HOLD);
+            mgpu::diag::warn(pl);
+        }
         // R256: with the tap on (MVecTap=1, R254) a no-contract title CAN deliver
         // real vectors, so the arm holds for them exactly as it does on a
         // contract title, bounded by MVecHold. "Synthetic at once" is only for
@@ -20627,7 +20730,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             mgpu::diag::warn(nv);
             s.mvec_mode = 1;
         }
-        if (s.mvec_mode == 3 && (mvec_handle == 0 || s.mvec_stable < STABLE_NEED))
+        if (s.mvec_mode == 3 && (mvec_handle == 0 || s.mvec_stable < STABLE_NEED || mv_small_hold))
         {
             // R280j: while the virtual-target module is deciding WITH EVIDENCE (a four-channel
             // candidate is being written, no source yet), the hold does not count: the decision
@@ -20792,6 +20895,19 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             s.mvec_w = (unsigned)md2.Width;
             s.mvec_h = (unsigned)md2.Height;
             s.mvec_format = (unsigned)md2.Format;
+            // R330: the hold above is bounded on purpose. If it ran out and this is still the small
+            // source, say so here rather than letting the run read as a normal one.
+            if (arm_plausible && !mv_plausible)
+            {
+                char pw_[760];
+                snprintf(pw_, sizeof pw_,
+                         "[MGPU][R330] taking the small velocity source anyway: %ux%u against a %ux%u scene, after "
+                         "the %llu-frame hold. Expect every frame to be size-rejected and this session to carry no "
+                         "vectors; if that happens, restart the title once the scene extent is up and it will arm "
+                         "there. MVecArmPlausible=0 disables this guard entirely.",
+                         mv_pw, mv_ph, sc_w, sc_h, MV_PLAUSIBLE_HOLD);
+                mgpu::diag::warn(pw_);
+            }
             UINT mrows2 = 0; UINT64 mrowb2 = 0;
             gdev->GetCopyableFootprints(&md2, 0, 1, 0, &s.mvec_fp2,
                                         &mrows2, &mrowb2, &s.mvec_bytes2);
@@ -22906,6 +23022,31 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         s.mvec_scale_x, s.mvec_scale_y,
                         (mtot != 0) ? (100.0 * (double)s.mvec_seen_valid / (double)mtot) : 0.0);
                     mgpu::diag::info(ml);
+
+                    // R330 (2026-10-22). THE LANE EITHER CARRIES OR IT DOES NOT, and a picture verdict
+                    // taken from a session that carried nothing is not a verdict about the key under test.
+                    // The 0.0% on the line above is easy to miss; on 2026-10-21 a whole round was read as
+                    // "NRScale 0.50" when its velocity lane was dead from the first second. Say it once,
+                    // in words, with both extents and the counter that explains it.
+                    {
+                        const unsigned long long copies_now = s.mvec_copies.load(std::memory_order_relaxed);
+                        const unsigned long long rej_now = s.mvec_size_rejects.load(std::memory_order_relaxed);
+                        if (!s.mvec_dead_said && copies_now == 0ull && rej_now >= 60ull)
+                        {
+                            s.mvec_dead_said = true;
+                            char dl[760];
+                            snprintf(dl, sizeof dl,
+                                     "[MGPU][R78] MVEC LANE DEAD: the arm sized the velocity region %ux%u and the "
+                                     "publisher keeps handing a different resource (size-rejected=%llu, copies=0), so "
+                                     "every evaluate in this session runs with NO motion vectors. The usual cause is a "
+                                     "startup buffer: the arm latched a loading-screen contract and the scene has since "
+                                     "grown. Restart the title and check that [R78] reads 100.0%% before judging any "
+                                     "picture from this run. (R330 holds the arm for such a source; MVecArmPlausible=0 "
+                                     "turns that off.)",
+                                     s.mvec_w, s.mvec_h, rej_now);
+                            mgpu::diag::warn(dl);
+                        }
+                    }
 
                     // ---- R182 / R184: OCCUPANCY, FOOTPRINT, AND RECREATION ----
                     //
@@ -25252,6 +25393,7 @@ void stream_poll()
                     ti.depth_valid = s.depth_slot_valid[slot] != 0u;
                     float tsx = s.mvec_scale_x, tsy = s.mvec_scale_y;
                     mgpu::calibrator::override_scale(tsx, tsy);   // same R105 value NR is handed
+                    if (s.mvec_scale_mul != 1.0f) { tsx *= s.mvec_scale_mul; tsy *= s.mvec_scale_mul; }   // R332: report what is handed
                     ti.scale_x = tsx; ti.scale_y = tsy;
                     { mgpu::calibrator::table ct; if (mgpu::calibrator::read(ct)) {
                         ti.jitter_x = ct.jitter_x; ti.jitter_y = ct.jitter_y; ti.mv_jittered = ct.mv_jittered; } }
@@ -25297,6 +25439,14 @@ void stream_poll()
                         mgpu::diag::info(gl);
                     }
                     s.gate_break = no_dlss;
+                }
+                // R331: one reset per source change, carried into every pass of this frame (see the
+                // producer above). Read once, before the pass loop, or the second pass would see the
+                // epoch already consumed and keep its stale history.
+                bool src_rst = false;
+                {
+                    const unsigned long long ep = s.mvec_src_epoch.load(std::memory_order_relaxed);
+                    if (ep != s.mvec_src_epoch_seen) { s.mvec_src_epoch_seen = ep; src_rst = true; }
                 }
                 for (unsigned pi = 0; pi < npass; ++pi)
                 {
@@ -25477,13 +25627,17 @@ void stream_poll()
                         // a consumer that never falls behind this multiplies by
                         // 1.0 and the evaluate is byte-identical to R83's.
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        // R332: the units multiplier is applied to a LOCAL, never to the member -
+                        // multiplying the member would compound once per evaluate.
+                        float sx_ngx = s.mvec_scale_x, sy_ngx = s.mvec_scale_y;
+                        if (s.mvec_scale_mul != 1.0f) { sx_ngx *= s.mvec_scale_mul; sy_ngx *= s.mvec_scale_mul; }
                         // D2.0 NR2: one presented step of a rendered frame's
                         // motion while frame generation is active (fg_frac is
                         // 1.0 otherwise). With a thinned frame before this one
                         // mv_el is 2 and the product is one rendered step.
                         const float mv_k = cv_here ? 1.0f : ((t119_temporal && !own_el) ? tdec.mv_k : mv_el) * fg_frac;   // R217 / R300a1: tdec.mv_k == mv_el unless TemporalMV=single
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", sx_ngx * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", sy_ngx * mv_k);
                         if (jout.apply)   // R300a7 (JitterSlot=1 only): the SLOT delta replaces R104's for this evaluate
                         {
                             s.nr_params->Set("DLSSNR.MVecOffsetX", jout.ox);
@@ -25493,7 +25647,7 @@ void stream_poll()
                             if (jout.sync) mgpu::calibrator::sync_jitter_state();   // JitterFallback=sync|zero only
                         }
                         else
-                            mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                            mgpu::calibrator::apply_jitter_offset(s.nr_params, sx_ngx, sy_ngx);   // R104 / R332 same final scale
                         // R212: the region, scaled to the vectors' own size.
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
                             ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
@@ -25523,10 +25677,12 @@ void stream_poll()
                         // through to R61's unset below.
                         s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_keep);
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        float sx_fg = s.mvec_scale_x, sy_fg = s.mvec_scale_y;               // R332
+                        if (s.mvec_scale_mul != 1.0f) { sx_fg *= s.mvec_scale_mul; sy_fg *= s.mvec_scale_mul; }
                         const float mv_k = mv_el * fg_frac;
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
-                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                        s.nr_params->Set("DLSSNR.MVecScaleX", sx_fg * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", sy_fg * mv_k);
+                        mgpu::calibrator::apply_jitter_offset(s.nr_params, sx_fg, sy_fg);   // R104 / R332
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
                             ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
@@ -25661,6 +25817,7 @@ void stream_poll()
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
                     if (gate_rst) rst = 1u;     // R323: no history across frames the game's DLSS did not evaluate
+if (src_rst) rst = 1u;      // R331: the velocity source changed identity - do not reproject across it
                     s.nr_params->Set("DLSSNR.Reset", rst);
                     // [OURS] NRS: a feature rebuilt by a live scale change has no history;
                     // the first evaluate on it must discard whatever the module still has.
