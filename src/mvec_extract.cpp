@@ -78,6 +78,11 @@ namespace
     // ---- our objects on the game device ----
     ID3D12Resource *g_staging = nullptr;      // same format as the source, scene size
     ID3D12Resource *g_target = nullptr;       // R16G16_FLOAT, scene size: the virtual velocity target
+    // R345 (2026-10-23, half-resolution MV): the target's extent. Equal to the scene size on the
+    // published path; half of it (rounded up) with MVecHalf=1. The staging buffer always stays at
+    // the scene size - it is the game's own copy - so only the extraction target shrinks.
+    bool     g_half = false;
+    unsigned g_tw = 0, g_th = 0;
     reshade::api::resource g_target_api = { 0 };
     ID3D12RootSignature *g_rs = nullptr;
     ID3D12PipelineState *g_pso = nullptr;
@@ -115,13 +120,28 @@ namespace
     const char *kExtractHLSL =
         "Texture2D<float4> src : register(t0);\n"
         "RWTexture2D<float2> dst : register(u0);\n"
-        "cbuffer C : register(b0) { uint W; uint H; uint pad0; uint pad1; };\n"
+        // R345 (2026-10-23): Z is the zero-pass flag (was pad0), STEP is the sampling stride -
+        // 1 for the published path, 2 when MVecHalf=1 builds the target at half the scene size.
+        "cbuffer C : register(b0) { uint W; uint H; uint Z; uint STEP; };\n"
         "[numthreads(8,8,1)]\n"
         "void main(uint3 id : SV_DispatchThreadID)\n"
         "{\n"
         "    if (id.x >= W || id.y >= H) return;\n"
-        "    float4 v = src.Load(int3(id.xy, 0));\n"   // SNORM/UNORM/FLOAT decoded by the view
-        "    dst[id.xy] = (pad0 != 0u) ? float2(0.0, 0.0) : v.xy;\n"
+        "    float2 v;\n"
+        "    if (STEP <= 1u)\n"
+        "    {\n"
+        "        v = src.Load(int3(id.xy, 0)).xy;\n"   // SNORM/UNORM/FLOAT decoded by the view
+        "    }\n"
+        "    else\n"
+        "    {\n"
+        // 2x2 box average: steadier than a point sample, and the thin-edge softening it costs is
+        // exactly what this experiment is meant to expose.
+        "        int2 b = int2(id.xy) * 2;\n"
+        "        float4 a = src.Load(int3(b, 0)) + src.Load(int3(b + int2(1, 0), 0))\n"
+        "                 + src.Load(int3(b + int2(0, 1), 0)) + src.Load(int3(b + int2(1, 1), 0));\n"
+        "        v = a.xy * 0.25;\n"
+        "    }\n"
+        "    dst[id.xy] = (Z != 0u) ? float2(0.0, 0.0) : v;\n"
         "}\n";
 
     bool is_game(reshade::api::device *d)
@@ -482,7 +502,24 @@ namespace
         // the virtual velocity target: created THROUGH ReShade's device, so it is
         // a ReShade resource handle (what the probe's tap copies) and is destroyed
         // through the same device at shutdown. The census is told about it below.
-        reshade::api::resource_desc vd(g_w, g_h, 1, 1, reshade::api::format::r16g16_float, 1,
+        //
+        // R345 (2026-10-23, half-resolution MV): MVecHalf=1 builds this target at half the scene
+        // size. The staging buffer above stays at the scene size (it is the game's own copy), so
+        // only the published field shrinks: 4x less to copy, and [R278c] then derives MVecScale
+        // from source/vector extents = 2.0, which is what tells the model the field is low-res.
+        g_half = mgpu::gpu1::ui_ini_read("MVecHalf", 0) != 0;
+        g_tw = g_half ? (g_w + 1u) / 2u : g_w;
+        g_th = g_half ? (g_h + 1u) / 2u : g_h;
+        if (g_half)
+        {
+            snprintf(l, sizeof l,
+                     "[MGPU][R345] MVecHalf=1: the virtual velocity target is %ux%u (half of %ux%u), 2x2 box "
+                     "average, so the field carries UV vectors at half resolution and the copy is 1/4 the "
+                     "bytes. If the picture moves about twice as fast as it should, the model is reading the "
+                     "field as full resolution - set MVecHalf=0.", g_tw, g_th, g_w, g_h);
+            mgpu::diag::info(l);
+        }
+        reshade::api::resource_desc vd(g_tw, g_th, 1, 1, reshade::api::format::r16g16_float, 1,
                                        reshade::api::memory_heap::gpu_only,
                                        reshade::api::resource_usage::unordered_access | reshade::api::resource_usage::shader_resource | reshade::api::resource_usage::copy_source);
         if (!api_dev->create_resource(vd, nullptr, reshade::api::resource_usage::shader_resource, &g_target_api) || g_target_api.handle == 0)
@@ -1300,9 +1337,9 @@ void on_finish_effects(void *reshade_command_list, void *reshade_command_queue)
     ID3D12DescriptorHeap *heaps[1] = { g_heap };
     g_list->SetDescriptorHeaps(1, heaps);
     g_list->SetComputeRootDescriptorTable(0, g_heap->GetGPUDescriptorHandleForHeapStart());
-    const unsigned c[4] = { g_w, g_h, zero_pass ? 1u : 0u, 0 };
+    const unsigned c[4] = { g_tw, g_th, zero_pass ? 1u : 0u, g_half ? 2u : 1u };
     g_list->SetComputeRoot32BitConstants(1, 4, c, 0);
-    g_list->Dispatch((g_w + 7u) / 8u, (g_h + 7u) / 8u, 1u);
+    g_list->Dispatch((g_tw + 7u) / 8u, (g_th + 7u) / 8u, 1u);
     b[0].Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; b[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
     g_list->ResourceBarrier(1, &b[0]);   // staging back to COPY_DEST for the next mid-frame copy
     g_list->Close();

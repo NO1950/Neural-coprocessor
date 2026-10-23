@@ -1568,6 +1568,7 @@ void report_process_census_at_arm();
 // by the panel for display only. See the sampler inside present_frame.
 static double        g_pr_ms[180] = {};
 static unsigned      g_pr_n = 0u, g_pr_i = 0u;
+static unsigned      g_pr_log_n = 0u;   // R333: log the ring every 120 presents
 static LARGE_INTEGER g_pr_last{};
 static std::atomic<int> g_pr_on{0};   // R299: the sampler runs only when the NRScale path armed
 
@@ -1597,6 +1598,38 @@ bool present_frame(float r, float g, float b)
             }
         }
         g_pr_last = pr_now;
+
+        // R333 (2026-10-22). THE ON SCREEN RATE WAS PANEL-ONLY. A figure that exists only in
+        // the overlay cannot be quoted in a report, and the obvious substitute -- "GPU 1" /
+        // consumer-finished frames -- reads HIGH on this rig because a finished frame can be
+        // superseded before it is ever shown. Log the same ring the panel reads, every 120
+        // presents, so a run can be quoted without a screenshot of the panel.
+        if (++g_pr_log_n >= 120u)
+        {
+            g_pr_log_n = 0u;
+            unsigned n = g_pr_n; if (n > 180u) n = 180u;
+            if (n > 1u)
+            {
+                double v[180];
+                double sum = 0.0;
+                for (unsigned i = 0; i < n; ++i) { v[i] = g_pr_ms[i]; sum += v[i]; }
+                for (unsigned i = 1; i < n; ++i)   // insertion sort: n <= 180
+                {
+                    const double key = v[i];
+                    unsigned j = i;
+                    while (j > 0u && v[j - 1u] > key) { v[j] = v[j - 1u]; --j; }
+                    v[j] = key;
+                }
+                const double fps = (sum > 0.0) ? (1000.0 * (double)n / sum) : 0.0;
+                const unsigned i99 = (n * 99u) / 100u < n ? (n * 99u) / 100u : n - 1u;
+                char line[256];
+                snprintf(line, sizeof line,
+                         "[MGPU][R333] ON SCREEN fps=%.1f p50=%.2fms p99=%.2fms n=%u "
+                         "(the present ring, i.e. what the eye gets; GPU 1 / consumer fps reads high)",
+                         fps, v[n / 2u], v[i99], n);
+                mgpu::diag::info(line);
+            }
+        }
     }
 
     ID3D12Device *dev = nullptr;
@@ -10095,7 +10128,17 @@ namespace
         // never showed this. Nothing required the answer to be STABLE.
         unsigned long long mvec_seen_handle = 0;
         unsigned long long mvec_stable = 0;
+        // R330 (2026-10-22): the startup-contract guard and the lane verdict. See the arm gate and
+        // the [R78] report for why they exist.
+        bool   mvec_small_said = false;   // R330: the "publisher is at a loading-screen extent" line, once
+        bool   mvec_dead_said = false;    // R330: the "this session carries no vectors" line, once
+        unsigned long long mvec_src_last = 0;   // R331: the published handle the lane is currently carrying
+        std::atomic<unsigned long long> mvec_src_epoch{0};   // R331: bumped once per confirmed source change
+        unsigned long long mvec_src_epoch_seen = 0;          // R331: consumer-side; only the consumer thread writes it
+        unsigned long long mvec_src_cand = 0;   // R331: the candidate new handle ...
+        unsigned mvec_src_cand_n = 0;           // ... and how many consecutive frames it has held (hysteresis)
         unsigned long long mvec_unpacks = 0;
+        unsigned long long mvec_copy_skips = 0;   // R335 (knife 2B): copies withheld because the consumer was already behind
         unsigned long long mvec_bound = 0, mvec_skipped = 0;
         unsigned long long mvec_seen_valid = 0, mvec_seen_invalid = 0;
         unsigned long long mvec_contract = 0;
@@ -10143,6 +10186,18 @@ namespace
         std::mutex mvec_cs;
         std::atomic<bool> mvec_live{false};
         std::atomic<unsigned long long> produced_a{0};
+        // R335 (knife 2B, 2026-10-23): the consumer's frame counter, mirrored where the consumer
+        // writes s.consumed, so the RENDER thread can ask "is the consumer already behind?" without
+        // reading a plain 64-bit field across threads (the same torn-read argument as produced_a).
+        std::atomic<unsigned long long> consumed_a{0};
+        // R346 (2026-10-23, temporal coupling): the consumer publishes the WINDOW of sealed frames it
+        // is about to work through (sched_to - 3 .. sched_to + 2), and the render thread copies a
+        // frame's vectors only when that frame falls inside it. Zero means "nothing published yet",
+        // and the producer copies unconditionally then, so a cold start cannot starve.
+        std::atomic<unsigned long long> mvec_need_lo{0};
+        std::atomic<unsigned long long> mvec_need_hi{0};
+        unsigned long long mvec_demand_skips = 0;
+        unsigned long long mvec_even_skips = 0;   // R349: odd frames that reused the kept field
 
         // The GPU 1 landing pair. tex_mvec stays the SYNTHETIC field's texture
         // and is untouched, so the mode-1 control arm is byte-identical to
@@ -10152,6 +10207,17 @@ namespace
         // f+1's vectors would otherwise land in the texture frame f is being
         // evaluated from.
         ID3D12Resource *tex_mvec_r[2] = {};
+        // R347 (2026-10-23, knife B). The RECONSTRUCTED field: full display size, built on GPU 1 from
+        // the half-resolution transport (MVecHalf=1) with a colour-guided bilateral upsample. The
+        // model is handed this, not the half-resolution texture, so its metadata (extent, subrect)
+        // is exactly what it gets on the published path and only the VALUES are approximated.
+        ID3D12Resource *mv_rec[2] = {};
+        ID3D12RootSignature *mu_rs = nullptr;
+        ID3D12PipelineState *mu_pso = nullptr;
+        ID3D12DescriptorHeap *mu_heap = nullptr;
+        bool mu_ready = false;
+        unsigned mu_inc = 0;
+        unsigned long long mu_runs = 0;
         // D2.0 NR2: the last rendered frame's vectors, kept for a generated
         // frame. tex_mvec_r cannot serve: its other half is being written for
         // frame f+1 by the copy queue while frame f evaluates. Copied on the
@@ -10321,6 +10387,13 @@ namespace
         int depth_inverted = 1;
         float mvec_dx = 0.0f, mvec_dy = 0.0f;
         float mvec_scale_x = 1.0f, mvec_scale_y = 1.0f;
+        // R332 (2026-10-22): a multiplier ON TOP of whatever R105 resolves. R105 replaced the
+        // ini's typed scale with the game's own table value on any title where the calibrator
+        // resolves, which makes MVecScaleX/Y untestable there: on Far Cry 6 the table says
+        // 1.0000 and an ini of 1.0300 was silently discarded ([R105] said so, the evaluate
+        // still got 1.0). A units/space error is the one mechanism that produces a smear which
+        // grows with speed and does NOT respond to frame age, so it has to be testable.
+        float mvec_scale_mul = 1.0f;
         bool  mvec_dirty = true;
         // R290 (0.3.1): the depth hold's bound (DepthHoldMax), read at stream_request.
         unsigned long long depth_hold_max_ms = 180000ull;   // 0 = no bound (the 0.2.4 / 0.3.0 hold)
@@ -12003,6 +12076,33 @@ namespace
         "  int2 sp = int2(uv * float2(gSrc));\n"
         "  sp = clamp(sp, int2(0,0), int2(gSrc) - int2(1,1));\n"
         "  oDepth[id.xy] = gDepth.Load(int3(sp, 0));\n"
+        "}\n";
+
+    // R347 (2026-10-23, knife B): the colour-guided bilateral that rebuilds a full-size motion field
+    // from a half-size one on GPU 1. One output pixel per display pixel: it pulls the 2x2 block of
+    // half-resolution vectors around its position and weights each by how close that block's COLOUR
+    // is to the output pixel's own, so an edge in the picture picks the vector from its own side.
+    const char *kMvecReconstructHLSL =
+        "Texture2D<float2> mvS : register(t0);\n"
+        "Texture2D<float4> colS : register(t1);\n"
+        "RWTexture2D<float2> outMv : register(u0);\n"
+        "cbuffer C : register(b0) { uint W; uint H; uint SW; uint SH; };\n"
+        "[numthreads(8,8,1)]\n"
+        "void main(uint3 id : SV_DispatchThreadID)\n"
+        "{\n"
+        "    if (id.x >= W || id.y >= H) return;\n"
+        "    int2 b = int2(id.xy) >> 1;\n"
+        "    float c = dot(colS.Load(int3(id.xy, 0)).rgb, float3(0.299, 0.587, 0.114));\n"
+        "    float2 acc = float2(0.0, 0.0); float wsum = 0.0;\n"
+        "    [unroll] for (int dy = 0; dy < 2; ++dy)\n"
+        "    [unroll] for (int dx = 0; dx < 2; ++dx)\n"
+        "    {\n"
+        "        int2 sp = clamp(b + int2(dx, dy), int2(0, 0), int2(SW, SH) - int2(1, 1));\n"
+        "        float cn = dot(colS.Load(int3(sp * 2, 0)).rgb, float3(0.299, 0.587, 0.114));\n"
+        "        float w = 1.0 / (0.02 + abs(cn - c));\n"
+        "        acc += mvS.Load(int3(sp, 0)) * w; wsum += w;\n"
+        "    }\n"
+        "    outMv[id.xy] = acc / wsum;\n"
         "}\n";
 
     typedef HRESULT (WINAPI *pfn_d3dcompile)(LPCVOID, SIZE_T, LPCSTR,
@@ -14768,6 +14868,144 @@ namespace
             s.mvec_keep_f = 0;
         }
 
+        // =====================================================================
+        // R347 (2026-10-23, knife B). THE RECONSTRUCTION PASS.
+        //
+        // MVecHalf=1 moves 8.3 MB a frame instead of 33.2, but handing the model a half-resolution
+        // field directly was rejected on the picture (OBS #56: "everything is blurry, even the
+        // menu"). This builds the field back to the display size on GPU 1 before the model sees it,
+        // so its extent, subrect and scale are exactly the published path's and the only difference
+        // is that the VALUES are interpolated. The guide is the colour frame, which is already on
+        // this card: 2x2 bilateral, weights from luma difference, so an edge in the colour image
+        // picks the motion vector from its own side of the edge instead of averaging both.
+        //
+        // MVecReconstruct=1 turns it on; absent or 0 leaves every published path byte-identical.
+        // =====================================================================
+        if (SUCCEEDED(h) && s.mvec_mode == 3 && s.mvec_w != 0 && s.mvec_h != 0 &&
+            (s.mvec_w != s.width || s.mvec_h != s.height) &&
+            mgpu::gpu1::ui_ini_read("MVecReconstruct", 0) != 0)
+        {
+            h = make_tex(ndev, s.width, s.height, (DXGI_FORMAT)s.mvec_format,
+                         D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                         D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.mv_rec[0]);
+            if (SUCCEEDED(h))
+                h = make_tex(ndev, s.width, s.height, (DXGI_FORMAT)s.mvec_format,
+                             D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                             D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, &s.mv_rec[1]);
+            if (SUCCEEDED(h))
+            {
+                HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+                pfn_d3dcompile p_compile =
+                    (dc != nullptr) ? (pfn_d3dcompile)GetProcAddress(dc, "D3DCompile") : nullptr;
+                ID3DBlob *cs = nullptr, *err = nullptr;
+                if (p_compile == nullptr)
+                    h = E_FAIL;
+                else
+                {
+                    h = p_compile(kMvecReconstructHLSL, strlen(kMvecReconstructHLSL), "mvec_reconstruct",
+                                  nullptr, nullptr, "main", "cs_5_1", 0, 0, &cs, &err);
+                    if (FAILED(h) && err != nullptr)
+                    {
+                        snprintf(line, sizeof line, "[MGPU][R347] the reconstruction kernel failed to "
+                                 "compile: 0x%08X %s", (unsigned)h, (const char *)err->GetBufferPointer());
+                        mgpu::diag::error(line);
+                    }
+                    if (err != nullptr) { err->Release(); err = nullptr; }
+                }
+                if (SUCCEEDED(h) && cs != nullptr)
+                {
+                    D3D12_DESCRIPTOR_RANGE rng[2] = {};
+                    rng[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+                    rng[0].NumDescriptors = 2; rng[0].BaseShaderRegister = 0;
+                    rng[0].OffsetInDescriptorsFromTableStart = 0;
+                    rng[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+                    rng[1].NumDescriptors = 1; rng[1].BaseShaderRegister = 0;
+                    rng[1].OffsetInDescriptorsFromTableStart = 2;
+                    D3D12_ROOT_PARAMETER rp[2] = {};
+                    rp[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+                    rp[0].DescriptorTable.NumDescriptorRanges = 2;
+                    rp[0].DescriptorTable.pDescriptorRanges = rng;
+                    rp[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    rp[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+                    rp[1].Constants.ShaderRegister = 0;
+                    rp[1].Constants.Num32BitValues = 4;
+                    rp[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+                    D3D12_ROOT_SIGNATURE_DESC rsd{};
+                    rsd.NumParameters = 2; rsd.pParameters = rp;
+                    ID3DBlob *sig = nullptr;
+                    h = D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err);
+                    if (err != nullptr) { err->Release(); err = nullptr; }
+                    if (SUCCEEDED(h))
+                        h = ndev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+                                                      IID_PPV_ARGS(&s.mu_rs));
+                    if (sig != nullptr) sig->Release();
+                    if (SUCCEEDED(h))
+                    {
+                        D3D12_COMPUTE_PIPELINE_STATE_DESC pd{};
+                        pd.pRootSignature = s.mu_rs;
+                        pd.CS.pShaderBytecode = cs->GetBufferPointer();
+                        pd.CS.BytecodeLength = cs->GetBufferSize();
+                        h = ndev->CreateComputePipelineState(&pd, IID_PPV_ARGS(&s.mu_pso));
+                    }
+                    cs->Release();
+                }
+                if (SUCCEEDED(h))
+                {
+                    D3D12_DESCRIPTOR_HEAP_DESC hd{};
+                    hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+                    hd.NumDescriptors = 6;   // two parities, three each
+                    hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+                    h = ndev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s.mu_heap));
+                }
+                if (SUCCEEDED(h) && s.mu_heap != nullptr)
+                {
+                    const UINT inc = ndev->GetDescriptorHandleIncrementSize(
+                        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+                    s.mu_inc = inc;
+                    D3D12_CPU_DESCRIPTOR_HANDLE base = s.mu_heap->GetCPUDescriptorHandleForHeapStart();
+                    for (UINT p = 0; p < 2u; ++p)
+                    {
+                        D3D12_CPU_DESCRIPTOR_HANDLE hnd = base;
+                        hnd.ptr += (SIZE_T)p * 3u * inc;
+                        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+                        sv.Format = (DXGI_FORMAT)s.mvec_format;
+                        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        sv.Texture2D.MipLevels = 1;
+                        ndev->CreateShaderResourceView(s.tex_mvec_r[p], &sv, hnd);
+                        hnd.ptr += inc;
+                        sv = {};
+                        sv.Format = (DXGI_FORMAT)nrfmt;
+                        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        sv.Texture2D.MipLevels = 1;
+                        ndev->CreateShaderResourceView(s.tex_in[p], &sv, hnd);
+                        hnd.ptr += inc;
+                        D3D12_UNORDERED_ACCESS_VIEW_DESC uv{};
+                        uv.Format = (DXGI_FORMAT)s.mvec_format;
+                        uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+                        ndev->CreateUnorderedAccessView(s.mv_rec[p], nullptr, &uv, hnd);
+                    }
+                    s.mu_ready = true;
+                    snprintf(line, sizeof line,
+                             "[MGPU][R347] MVecReconstruct=1: the %ux%u field is carried at %ux%u and rebuilt on "
+                             "GPU 1 to %ux%u with a colour-guided 2x2 bilateral before the model sees it. Only the "
+                             "values are interpolated - extent, subrect and scale are the published path's.",
+                             s.mvec_w, s.mvec_h, s.mvec_w, s.mvec_h, s.width, s.height);
+                    mgpu::diag::info(line);
+                }
+            }
+            if (!s.mu_ready)
+            {
+                snprintf(line, sizeof line,
+                         "[MGPU][R347] the reconstruction pass could NOT be built (0x%08X) - the half-resolution "
+                         "field would go to the model as is, which was rejected on the picture, so MVecHalf is "
+                         "ignored for this run. Set MVecHalf=0 or fix the build.",
+                         (unsigned)h);
+                mgpu::diag::error(line);
+            }
+        }
+
         // R216: built last, once every texture it reads exists.
         if (SUCCEEDED(h) && s.vr_mode != 0u && !vr_arm(s, ndev, nrfmt))
         {
@@ -16114,6 +16352,56 @@ int mvec_source_mode()
 }
 bool stream_present_gate(unsigned long timeout_ms)
 {
+    // =====================================================================
+    // R336 (2026-10-23, knife P1). THE PRESENT RATE, FOR BOTH PATHS.
+    //
+    // The gate returns true on EVERY iteration while the stream is not armed
+    // (`if (!s.armed || s.summarised) { ++s.gate_presents; ret = true; }`), and
+    // on this rig that measured 240-489 presents/s -- each one a DWM
+    // composition of a 4K visual. That is also why the "bridge costs 13-16 fps"
+    // figure from the unarmed runs could not be trusted: it measured a spin,
+    // not the bridge at rest.
+    //
+    // PresentMaxFps caps the rate before either path runs. 0 (absent) keeps the
+    // old behaviour byte for byte, so nothing published changes unless set.
+    // =====================================================================
+    {
+        static double   g_max_fps = -1.0;
+        static LONGLONG g_last_qpc = 0;
+        if (g_max_fps < 0.0)
+        {
+            g_max_fps = (double)ui_ini_read("PresentMaxFps", 0);
+            if (g_max_fps < 0.0) g_max_fps = 0.0;
+            if (g_max_fps > 0.0)
+            {
+                char l[240];
+                snprintf(l, sizeof l,
+                         "[MGPU][R336] PresentMaxFps=%.1f: the present loop is capped to that rate on BOTH paths "
+                         "(armed and unarmed). 0 = old behaviour: once per consumed frame when armed, every loop "
+                         "iteration when not.", g_max_fps);
+                mgpu::diag::info(l);
+            }
+        }
+        if (g_max_fps > 0.0)
+        {
+            stream_state &s0 = str();
+            LARGE_INTEGER now{};
+            QueryPerformanceCounter(&now);
+            if (g_last_qpc != 0 && s0.freq.QuadPart != 0)
+            {
+                const double ms = (double)(now.QuadPart - g_last_qpc) * 1000.0 / (double)s0.freq.QuadPart;
+                const double period = 1000.0 / g_max_fps;
+                if (ms < period)
+                {
+                    const DWORD wait = (DWORD)(period - ms);
+                    if (wait > 0) Sleep(wait);
+                    QueryPerformanceCounter(&now);
+                }
+            }
+            g_last_qpc = now.QuadPart;
+        }
+    }
+
     stream_state &s = str();
     ID3D12Fence *f = nullptr;
     UINT64 want = 0;
@@ -19191,6 +19479,21 @@ void stream_request()
     s.mvec_dy      = ini_read_named_float("MVecDY", 0.0f);
     s.mvec_scale_x = ini_read_named_float("MVecScaleX", 1.0f);
     s.mvec_scale_y = ini_read_named_float("MVecScaleY", 1.0f);
+    // R332: the units test that R105 made impossible. Clamped so a typo cannot hand NGX a
+    // scale that turns a reprojection into a teleport.
+    s.mvec_scale_mul = ini_read_named_float("MVecScaleMul", 1.0f);
+    if (!(s.mvec_scale_mul > 0.25f && s.mvec_scale_mul < 4.0f)) s.mvec_scale_mul = 1.0f;
+    if (s.mvec_scale_mul != 1.0f)
+    {
+        char ml[600];
+        snprintf(ml, sizeof ml,
+                 "[MGPU][R332] MVecScaleMul=%.4f: multiplied on top of whatever R105 resolves (the game's own "
+                 "table wins over MVecScaleX/Y whenever the calibrator resolves). This is the units test: a "
+                 "wrong vector space gives a smear that grows with speed and does not answer to frame age. "
+                 "Take the picture verdict from this run against a MVecScaleMul=1.0000 run at the same NRScale.",
+                 (double)s.mvec_scale_mul);
+        mgpu::diag::info(ml);
+    }
     s.mvec_dirty   = true;
     {
         const int cqm = ini_read_copy_queue();
@@ -20318,6 +20621,31 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
     // periodic report name the resource the lane was looking at when it went
     // quiet, without this file ever including the probe's header.
     s.mvec_pub_handle.store(mvec_handle, std::memory_order_relaxed);
+    // R331 (2026-10-22). THE PROVIDER RULE, taken from GITC-Uplift: a source that changes identity is
+    // a different history. Uplift forces a reset_hint the moment its MV provider changes; our lane had
+    // no equivalent, so a contract recreated around a menu or a device reset was reprojected against a
+    // history built from the previous buffer. Twelve consecutive frames of the new handle are required
+    // before it counts, because some titles alternate pool members frame to frame and a reset on each
+    // of those would remove history entirely.
+    if (mvec_handle != 0ull)
+    {
+        if (s.mvec_src_last == 0ull) s.mvec_src_last = mvec_handle;
+        else if (mvec_handle == s.mvec_src_last) { s.mvec_src_cand = 0ull; s.mvec_src_cand_n = 0u; }
+        else
+        {
+            if (s.mvec_src_cand == mvec_handle) ++s.mvec_src_cand_n;
+            else { s.mvec_src_cand = mvec_handle; s.mvec_src_cand_n = 1u; }
+            if (s.mvec_src_cand_n >= 12u)
+            {
+                mgpu::diag::info("[MGPU][R331] MVEC SOURCE CHANGED: the publisher now hands a different buffer. "
+                                 "One NR reset is owed so history is not reprojected across the change "
+                                 "(GITC-Uplift's provider rule; 12-frame hysteresis against pool alternation).");
+                s.mvec_src_last = mvec_handle;
+                s.mvec_src_cand = 0ull; s.mvec_src_cand_n = 0u;
+                s.mvec_src_epoch.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        }
+    }
     // R324 (MVecBarrierSource=2): the re-judge, AT THE EVENT. The judge's verdict (TAIL / EVALUATE) was
     // proven on one published buffer. When the game publishes another (a rebuild around a menu on
     // Cyberpunk 2026-10-16, a pool member on Dragon Sword, a feature recreate on Starfield), the window
@@ -20509,6 +20837,53 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             else { s.mvec_seen_handle = mvec_handle; s.mvec_stable = 1; }
         }
         const unsigned long long STABLE_NEED = 240ull;   // ~4 s at 60 fps
+        // R330 (2026-10-22). THE STARTUP CONTRACT TRAP, measured on Far Cry 6.
+        //
+        // Run 20261021-B1_nrs050: the game was still at 1280x720 when feeder built its DLAA
+        // contract, that handle then stayed identical for STABLE_NEED frames, the arm sized the
+        // velocity region 1280x720 against a 3840x2160 scene, and every frame after the game
+        // recreated its device at 4K was size-rejected. [R78] ended the run at
+        //   region 1280x720 ... copies=0 missing=12008 size-rejected=23892 ... 0.0% of sealed
+        //   frames carried vectors
+        // and a picture verdict was still taken from that session. R99 fixed the case where the
+        // handle MOVES; this is the case where it does not move, it is simply the wrong buffer.
+        //
+        // A velocity target at or above the colour extent is the normal shape here (R70: display
+        // extent while colour renders at 65%). A source under a quarter of the scene is a
+        // loading-screen buffer, so hold for a scene-extent one - bounded, and take the small one
+        // anyway when the bound runs out, so a title whose MV is honestly low-resolution pays ten
+        // seconds once instead of reading as broken forever. MVecArmPlausible=0 restores the old arm.
+        const bool arm_plausible = ui_ini_read("MVecArmPlausible", 1) != 0;
+        bool mv_plausible = true;
+        unsigned mv_pw = 0u, mv_ph = 0u, sc_w = 0u, sc_h = 0u;
+        if (mvec_handle != 0ull && src != nullptr)
+        {
+            const D3D12_RESOURCE_DESC mdp =
+                reinterpret_cast<ID3D12Resource *>((void *)(uintptr_t)mvec_handle)->GetDesc();
+            const D3D12_RESOURCE_DESC sdp = src->GetDesc();
+            mv_pw = (unsigned)mdp.Width; mv_ph = (unsigned)mdp.Height;
+            sc_w = (unsigned)sdp.Width;  sc_h = (unsigned)sdp.Height;
+            if (sc_w != 0u && sc_h != 0u && mv_pw != 0u && mv_ph != 0u)
+                mv_plausible = ((unsigned long long)mv_pw * (unsigned long long)mv_ph * 4ull >=
+                                (unsigned long long)sc_w * (unsigned long long)sc_h);
+        }
+        unsigned long long mv_hold = (unsigned long long)ui_ini_read("MVecArmWait", 900);   // R330: frames to wait for a scene-extent source
+        if (mv_hold < 120ull) mv_hold = 120ull;
+        if (mv_hold > 3600ull) mv_hold = 3600ull;
+        const unsigned long long MV_PLAUSIBLE_HOLD = mv_hold;
+        const bool mv_small_hold = arm_plausible && !mv_plausible && s.mvec_arm_waits < MV_PLAUSIBLE_HOLD;
+        if (arm_plausible && !mv_plausible && !s.mvec_small_said)
+        {
+            s.mvec_small_said = true;
+            char pl[720];
+            snprintf(pl, sizeof pl,
+                     "[MGPU][R330] MVEC arm withheld: the publisher's buffer is %ux%u, under a quarter of the "
+                     "scene %ux%u. That is the shape of a loading-screen contract (Far Cry 6 armed 1280x720 "
+                     "against 3840x2160 on 2026-10-21 and the whole run carried 0.0%% of vectors). Holding for "
+                     "up to %llu frame(s) for a scene-extent source; MVecArmPlausible=0 restores the old arm.",
+                     mv_pw, mv_ph, sc_w, sc_h, MV_PLAUSIBLE_HOLD);
+            mgpu::diag::warn(pl);
+        }
         // R256: with the tap on (MVecTap=1, R254) a no-contract title CAN deliver
         // real vectors, so the arm holds for them exactly as it does on a
         // contract title, bounded by MVecHold. "Synthetic at once" is only for
@@ -20627,7 +21002,7 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             mgpu::diag::warn(nv);
             s.mvec_mode = 1;
         }
-        if (s.mvec_mode == 3 && (mvec_handle == 0 || s.mvec_stable < STABLE_NEED))
+        if (s.mvec_mode == 3 && (mvec_handle == 0 || s.mvec_stable < STABLE_NEED || mv_small_hold))
         {
             // R280j: while the virtual-target module is deciding WITH EVIDENCE (a four-channel
             // candidate is being written, no source yet), the hold does not count: the decision
@@ -20792,6 +21167,19 @@ void stream_on_finish_effects(void *cmd_list_v, void *cmd_queue_v,
             s.mvec_w = (unsigned)md2.Width;
             s.mvec_h = (unsigned)md2.Height;
             s.mvec_format = (unsigned)md2.Format;
+            // R330: the hold above is bounded on purpose. If it ran out and this is still the small
+            // source, say so here rather than letting the run read as a normal one.
+            if (arm_plausible && !mv_plausible)
+            {
+                char pw_[760];
+                snprintf(pw_, sizeof pw_,
+                         "[MGPU][R330] taking the small velocity source anyway: %ux%u against a %ux%u scene, after "
+                         "the %llu-frame hold. Expect every frame to be size-rejected and this session to carry no "
+                         "vectors; if that happens, restart the title once the scene extent is up and it will arm "
+                         "there. MVecArmPlausible=0 disables this guard entirely.",
+                         mv_pw, mv_ph, sc_w, sc_h, MV_PLAUSIBLE_HOLD);
+                mgpu::diag::warn(pw_);
+            }
             UINT mrows2 = 0; UINT64 mrowb2 = 0;
             gdev->GetCopyableFootprints(&md2, 0, 1, 0, &s.mvec_fp2,
                                         &mrows2, &mrowb2, &s.mvec_bytes2);
@@ -21863,6 +22251,131 @@ void stream_mvec_copy(void *cmd_list_v, unsigned long long mvec_handle)
         return;
     }
 
+    // =====================================================================
+    // R335 (knife 2B, 2026-10-23). THE COPY IS ON DEMAND NOW -- OPTIONALLY.
+    //
+    // Measured on FC6 (OBS #45-#50): the producer copies one 33.2 MB velocity
+    // buffer per PRESENTED frame (85-98/s) while the consumer only evaluates
+    // ~60/s, and that lane costs 8 fps of the render card (85 -> 77).
+    // MVecCopyAhead=N withholds a copy while the consumer is already N or more
+    // sealed frames behind: the frame ships without vectors, the consumer has
+    // plenty of prepared frames to pick from, and the render card stops
+    // copying frames nobody will look at. 0 (default) = the old behaviour,
+    // byte for byte.
+    // =====================================================================
+    static unsigned g_copy_ahead = 0u;
+    static bool     g_copy_ahead_init = false;
+    if (!g_copy_ahead_init)
+    {
+        g_copy_ahead_init = true;
+        const int v = (int)ui_ini_read("MVecCopyAhead", 0);
+        g_copy_ahead = (v > 0) ? (unsigned)v : 0u;
+        if (g_copy_ahead > 0u)
+        {
+            char l[288];
+            snprintf(l, sizeof l,
+                     "[MGPU][R335] MVecCopyAhead=%u: a presented frame's vector copy is SKIPPED while the consumer "
+                     "is %u or more sealed frames behind (0 = off: copy every presented frame)", g_copy_ahead, g_copy_ahead);
+            mgpu::diag::info(l);
+        }
+    }
+    if (g_copy_ahead > 0u)
+    {
+        const unsigned long long prod = s.produced_a.load(std::memory_order_acquire);
+        const unsigned long long cons = s.consumed_a.load(std::memory_order_acquire);
+        if (prod > cons && (prod - cons) >= (unsigned long long)g_copy_ahead)
+        {
+            if (s.mvec_copy_skips++ == 0ull)
+                mgpu::diag::info("[MGPU][R335] first withheld vector copy: the consumer is behind by the configured "
+                                 "margin, so this frame ships with none. Read [R78] with that in mind - copies will "
+                                 "now sit below seals instead of tracking them.");
+            return;
+        }
+    }
+
+    // =====================================================================
+    // R349 (2026-10-23, knife 2C). EVERY OTHER FRAME.
+    //
+    // R348's discriminator settled where the MV lane's 9 fps go: NOT in the consumer waiting on the
+    // unpack (removing that dependency changed nothing - 72 against 73), but in the copy itself.
+    // So halve the number of copies: an even sealed frame copies, an odd one reuses the copy the
+    // previous frame left in tex_mvec_keep. The field is never decimated in SPACE - the cost is one
+    // frame of motion lag on odd frames, which is a far milder trade than half resolution (that one
+    // was rejected on the picture twice).
+    // MVecEveryOther=1 turns it on; 0 (default) copies every presented frame.
+    // =====================================================================
+    {
+        static int g_every_other = -1;
+        if (g_every_other < 0)
+        {
+            // R349b: the value is the STRIDE, not a flag - 2 copies every second frame, 3 every third.
+            g_every_other = mgpu::gpu1::ui_ini_read("MVecEveryOther", 0);
+            if (g_every_other < 0) g_every_other = 0;
+            if (g_every_other == 1) g_every_other = 0;   // 1 means "copy every frame", i.e. off
+            if (g_every_other > 8) g_every_other = 8;
+            if (g_every_other != 0)
+            {
+                char sl[240];
+                snprintf(sl, sizeof sl,
+                         "[MGPU][R349] MVecEveryOther=%d: one frame in %d copies; the others are denoised with "
+                         "the kept field (up to %d frames of motion lag). Expect copies ~ seals/%d.",
+                         g_every_other, g_every_other, g_every_other - 1, g_every_other);
+                mgpu::diag::info(sl);
+            }
+        }
+        if (g_every_other != 0)
+        {
+            const unsigned long long this_frame = s.produced_a.load(std::memory_order_acquire) + 1ull;
+            if ((this_frame % (unsigned long long)g_every_other) != 0ull)
+            {
+                if (s.mvec_even_skips++ == 0ull)
+                    mgpu::diag::info("[MGPU][R349] first reused frame: it is denoised with the kept field. Read [R78] "
+                                     "copies against seals - copies should be about 1 in the stride.");
+                return;
+            }
+        }
+    }
+
+    // =====================================================================
+    // R346 (2026-10-23, temporal coupling). THE LOSSLESS HALF OF KNIFE 2.
+    //
+    // R335 guessed ("the consumer is N frames behind") and starved the lane, because this consumer
+    // is DESIGNED to sit a ring behind: prefetch evaluates the frame the copy queue already armed.
+    // Coupling asks instead of guessing. The consumer publishes the window of sealed frames it is
+    // about to work through (sched_to - 3 .. sched_to + 2, R346a below), and this side copies a
+    // frame only when that frame falls inside it. The field is never decimated, so nothing about
+    // the picture changes - only how many of the ~85 presented frames are copied for a consumer
+    // that evaluates ~60 of them.
+    // MVecCopyOnDemand=1 turns it on; 0 (default) copies every presented frame.
+    // =====================================================================
+    static int g_on_demand = -1;
+    if (g_on_demand < 0)
+    {
+        g_on_demand = (int)(mgpu::gpu1::ui_ini_read("MVecCopyOnDemand", 0) != 0 ? 1 : 0);
+        if (g_on_demand != 0)
+            mgpu::diag::info("[MGPU][R346] MVecCopyOnDemand=1: a presented frame's vector copy is made only when "
+                             "that frame is inside the consumer's announced window. The field is NOT decimated - "
+                             "read [R78] copies vs seals, and expect copies below seals with vector_present "
+                             "still at 100%.");
+    }
+    if (g_on_demand != 0)
+    {
+        const unsigned long long hi = s.mvec_need_hi.load(std::memory_order_acquire);
+        if (hi != 0ull)
+        {
+            const unsigned long long lo = s.mvec_need_lo.load(std::memory_order_acquire);
+            const unsigned long long this_frame = s.produced_a.load(std::memory_order_acquire) + 1ull;
+            if (this_frame < lo || this_frame > hi)
+            {
+                if (s.mvec_demand_skips++ == 0ull)
+                    mgpu::diag::info("[MGPU][R346] first frame copied ON DEMAND only: this frame sits outside the "
+                                     "consumer's window, so it ships with none. If vector_present falls, the window "
+                                     "is too narrow - widen it or set MVecCopyOnDemand=0.");
+                return;
+            }
+        }
+    }
+
     // R88: from the atomic mirror. produced is written under cs, which this
     // function no longer holds; a 64-bit read without one is a torn value
     // waiting to happen, and a torn slot index is a copy into the wrong slot.
@@ -22907,6 +23420,31 @@ static void seal_consume(stream_state &s, unsigned long long f, unsigned slot,
                         (mtot != 0) ? (100.0 * (double)s.mvec_seen_valid / (double)mtot) : 0.0);
                     mgpu::diag::info(ml);
 
+                    // R330 (2026-10-22). THE LANE EITHER CARRIES OR IT DOES NOT, and a picture verdict
+                    // taken from a session that carried nothing is not a verdict about the key under test.
+                    // The 0.0% on the line above is easy to miss; on 2026-10-21 a whole round was read as
+                    // "NRScale 0.50" when its velocity lane was dead from the first second. Say it once,
+                    // in words, with both extents and the counter that explains it.
+                    {
+                        const unsigned long long copies_now = s.mvec_copies.load(std::memory_order_relaxed);
+                        const unsigned long long rej_now = s.mvec_size_rejects.load(std::memory_order_relaxed);
+                        if (!s.mvec_dead_said && copies_now == 0ull && rej_now >= 60ull)
+                        {
+                            s.mvec_dead_said = true;
+                            char dl[760];
+                            snprintf(dl, sizeof dl,
+                                     "[MGPU][R78] MVEC LANE DEAD: the arm sized the velocity region %ux%u and the "
+                                     "publisher keeps handing a different resource (size-rejected=%llu, copies=0), so "
+                                     "every evaluate in this session runs with NO motion vectors. The usual cause is a "
+                                     "startup buffer: the arm latched a loading-screen contract and the scene has since "
+                                     "grown. Restart the title and check that [R78] reads 100.0%% before judging any "
+                                     "picture from this run. (R330 holds the arm for such a source; MVecArmPlausible=0 "
+                                     "turns that off.)",
+                                     s.mvec_w, s.mvec_h, rej_now);
+                            mgpu::diag::warn(dl);
+                        }
+                    }
+
                     // ---- R182 / R184: OCCUPANCY, FOOTPRINT, AND RECREATION ----
                     //
                     // Behind SFPath. Reads atomics the bridge thread filled
@@ -23681,6 +24219,15 @@ void stream_poll()
         ? mgpu::perf::sched_target(completed, s.consumed, s.cq_issued,
                                    s.copy_queue && s.cq_gated && s.cq != nullptr, s.finished)
         : completed;
+    // R346 (temporal coupling): publish the window the loop is about to work through. The render
+    // thread copies a frame's vectors only if that frame is inside it. Widened by 3 behind and 2
+    // ahead because the producer seals a frame before the consumer has decided to consume it, and
+    // a frame whose vectors were skipped cannot be copied later.
+    if (mgpu::t119::prefetch_active())
+    {
+        s.mvec_need_hi.store(sched_to + 2ull, std::memory_order_release);
+        s.mvec_need_lo.store(sched_to > 3ull ? sched_to - 3ull : 0ull, std::memory_order_release);
+    }
     if (s.rw_at == 0ull)
     {
         s.rw_at = s.consumed;
@@ -23691,6 +24238,7 @@ void stream_poll()
         const unsigned long long target = sched_to - (unsigned long long)s.rw;
         s.rw_skipped += target - s.consumed;
         s.consumed = target;
+        s.consumed_a.store(target, std::memory_order_release);   // R335: the render thread reads this
         // THE SKIP MUST NOT READ AS A DROP. last_seen is what the seal checker
         // compares the next frame's index against, so advancing consumed
         // without it made every skip look like a transport gap. The 2026-09-12
@@ -23736,6 +24284,7 @@ void stream_poll()
         const unsigned long long of = s.consumed + 1;
         ++s.overrun;
         s.consumed = of;
+        s.consumed_a.store(of, std::memory_order_release);   // R335
         if (!s.said_overrun)
         {
             s.said_overrun = true;
@@ -23838,6 +24387,7 @@ void stream_poll()
                 ++s.nr_skipped;
                 seal_consume(s, bfi[q], bsl[q], false, false, 0u);
                 s.consumed = bfi[q];
+                s.consumed_a.store(bfi[q], std::memory_order_release);   // R335
             }
         }
         else
@@ -23846,6 +24396,7 @@ void stream_poll()
             // seals it would have checked are lost and the next frame's gap
             // check will say so, which is the correct report.
             s.consumed = bulk_last;
+            s.consumed_a.store(bulk_last, std::memory_order_release);   // R335
         }
     }
 
@@ -24917,7 +25468,22 @@ void stream_poll()
                 // extract never earns one (Far Cry 6), the zero field is what DLSS-NR gets - from the first evaluate,
                 // not after a judge stepped aside from strobing vectors. The copies and the probes carry on so the
                 // verdict can still arrive. The tap path (Skyrim) and contract titles are not on this branch.
-                const bool r311e_zero = s.r309_aside || (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u);
+                // R348 (2026-10-23, the MV-wait discriminator): MVecCopyOnly=1 binds the ZERO field to
+                // NR while the transport keeps copying every presented frame. R309's step-aside cannot
+                // answer this - it stops the copy too (measured: vector_present 0.00%), so the run is
+                // just "no MV". This key removes ONLY the consumer's dependency on the unpack.
+                static int g_copy_only = -1;
+                if (g_copy_only < 0)
+                {
+                    g_copy_only = (mgpu::gpu1::ui_ini_read("MVecCopyOnly", 0) != 0) ? 1 : 0;
+                    if (g_copy_only != 0)
+                        mgpu::diag::info("[MGPU][R348] MVecCopyOnly=1: the transport copies every frame as "
+                                         "usual, but NR is handed the ZERO field. This exists to measure the "
+                                         "copy's cost without the consumer waiting on it. The picture has no "
+                                         "motion - never ship this setting on.");
+                }
+                const bool r311e_zero = s.r309_aside || g_copy_only != 0 ||
+                                        (g_mvec_x_active.load(std::memory_order_relaxed) && s.x_verdicts == 0u);
                 if (s.mvec_mode == 3 && r311e_zero && !s.r309_zero_ready &&
                     s.tex_mvec != nullptr && s.mvec_cpu != nullptr && s.mvec_up != nullptr)
                 {
@@ -25252,6 +25818,7 @@ void stream_poll()
                     ti.depth_valid = s.depth_slot_valid[slot] != 0u;
                     float tsx = s.mvec_scale_x, tsy = s.mvec_scale_y;
                     mgpu::calibrator::override_scale(tsx, tsy);   // same R105 value NR is handed
+                    if (s.mvec_scale_mul != 1.0f) { tsx *= s.mvec_scale_mul; tsy *= s.mvec_scale_mul; }   // R332: report what is handed
                     ti.scale_x = tsx; ti.scale_y = tsy;
                     { mgpu::calibrator::table ct; if (mgpu::calibrator::read(ct)) {
                         ti.jitter_x = ct.jitter_x; ti.jitter_y = ct.jitter_y; ti.mv_jittered = ct.mv_jittered; } }
@@ -25297,6 +25864,14 @@ void stream_poll()
                         mgpu::diag::info(gl);
                     }
                     s.gate_break = no_dlss;
+                }
+                // R331: one reset per source change, carried into every pass of this frame (see the
+                // producer above). Read once, before the pass loop, or the second pass would see the
+                // epoch already consumed and keep its stale history.
+                bool src_rst = false;
+                {
+                    const unsigned long long ep = s.mvec_src_epoch.load(std::memory_order_relaxed);
+                    if (ep != s.mvec_src_epoch_seen) { s.mvec_src_epoch_seen = ep; src_rst = true; }
                 }
                 for (unsigned pi = 0; pi < npass; ++pi)
                 {
@@ -25472,18 +26047,52 @@ void stream_poll()
                         // R217: the chained field on a late frame, in place of
                         // R87's multiply - not for a strip's own count.
                         const bool cv_here = cv_nr_on && !own_el;
-                        s.nr_params->Set("DLSSNR.MVec", cv_here ? s.cv_out : s.tex_mvec_r[ii]);
+                        // R347 (knife B): rebuild the full-size field on GPU 1 before binding it, so the
+                        // model sees the same extent it always does. Only when the transport really is
+                        // smaller than the display size and the pass was built.
+                        const bool mu_here = !cv_here && s.mu_ready && s.mv_rec[ii] != nullptr &&
+                                             (s.mvec_w != s.width || s.mvec_h != s.height) && s.nl != nullptr;
+                        if (mu_here)
+                        {
+                            D3D12_RESOURCE_BARRIER mb{};
+                            mb.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                            mb.Transition.pResource = s.mv_rec[ii];
+                            mb.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+                            mb.Transition.StateBefore = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                            mb.Transition.StateAfter = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            s.nl->ResourceBarrier(1, &mb);
+                            ID3D12DescriptorHeap *muheaps[1] = { s.mu_heap };
+                            s.nl->SetDescriptorHeaps(1, muheaps);
+                            s.nl->SetComputeRootSignature(s.mu_rs);
+                            s.nl->SetPipelineState(s.mu_pso);
+                            D3D12_GPU_DESCRIPTOR_HANDLE mgh = s.mu_heap->GetGPUDescriptorHandleForHeapStart();
+                            mgh.ptr += (SIZE_T)ii * 3u * (SIZE_T)s.mu_inc;
+                            s.nl->SetComputeRootDescriptorTable(0, mgh);
+                            const unsigned mc[4] = { s.width, s.height, s.mvec_w, s.mvec_h };
+                            s.nl->SetComputeRoot32BitConstants(1, 4, mc, 0);
+                            s.nl->Dispatch((s.width + 7u) / 8u, (s.height + 7u) / 8u, 1u);
+                            mb.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+                            mb.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+                            s.nl->ResourceBarrier(1, &mb);
+                            ++s.mu_runs;
+                        }
+                        s.nr_params->Set("DLSSNR.MVec", mu_here ? s.mv_rec[ii]
+                                                                : (cv_here ? s.cv_out : s.tex_mvec_r[ii]));
                         // R87: scaled by the frames that actually elapsed. With
                         // a consumer that never falls behind this multiplies by
                         // 1.0 and the evaluate is byte-identical to R83's.
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        // R332: the units multiplier is applied to a LOCAL, never to the member -
+                        // multiplying the member would compound once per evaluate.
+                        float sx_ngx = s.mvec_scale_x, sy_ngx = s.mvec_scale_y;
+                        if (s.mvec_scale_mul != 1.0f) { sx_ngx *= s.mvec_scale_mul; sy_ngx *= s.mvec_scale_mul; }
                         // D2.0 NR2: one presented step of a rendered frame's
                         // motion while frame generation is active (fg_frac is
                         // 1.0 otherwise). With a thinned frame before this one
                         // mv_el is 2 and the product is one rendered step.
                         const float mv_k = cv_here ? 1.0f : ((t119_temporal && !own_el) ? tdec.mv_k : mv_el) * fg_frac;   // R217 / R300a1: tdec.mv_k == mv_el unless TemporalMV=single
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleX", sx_ngx * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", sy_ngx * mv_k);
                         if (jout.apply)   // R300a7 (JitterSlot=1 only): the SLOT delta replaces R104's for this evaluate
                         {
                             s.nr_params->Set("DLSSNR.MVecOffsetX", jout.ox);
@@ -25493,21 +26102,27 @@ void stream_poll()
                             if (jout.sync) mgpu::calibrator::sync_jitter_state();   // JitterFallback=sync|zero only
                         }
                         else
-                            mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                            mgpu::calibrator::apply_jitter_offset(s.nr_params, sx_ngx, sy_ngx);   // R104 / R332 same final scale
                         // R212: the region, scaled to the vectors' own size.
+                        // R347: with the reconstruction on, the texture the model reads is the FULL
+                        // size one, so the subrect has to be expressed in ITS pixels.
+                        const unsigned mv_w_used = mu_here ? s.width  : s.mvec_w;
+                        const unsigned mv_h_used = mu_here ? s.height : s.mvec_h;
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
-                            ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
+                            ? (unsigned int)(((unsigned long long)rbx * mv_w_used) / s.width) : 0u);
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
-                            ? (unsigned int)(((unsigned long long)rby * s.mvec_h) / s.height) : 0u);
+                            ? (unsigned int)(((unsigned long long)rby * mv_h_used) / s.height) : 0u);
                         s.nr_params->Set("DLSSNR.MVecSubrectWidth", p2r_in
-                            ? (unsigned int)(((unsigned long long)rw * s.mvec_w) / s.width)
-                            : (unsigned int)s.mvec_w);
+                            ? (unsigned int)(((unsigned long long)rw * mv_w_used) / s.width)
+                            : (unsigned int)mv_w_used);
                         s.nr_params->Set("DLSSNR.MVecSubrectHeight", p2r_in
-                            ? (unsigned int)(((unsigned long long)rh * s.mvec_h) / s.height)
-                            : (unsigned int)s.mvec_h);
+                            ? (unsigned int)(((unsigned long long)rh * mv_h_used) / s.height)
+                            : (unsigned int)mv_h_used);
                         if (pi == 0 && sk == 0) ++s.mvec_bound;
                     }
-                    else if (!r309_zero && s.mvec_mode == 3 && fg_act && s.tex_mvec_keep != nullptr &&
+                    else if (!r309_zero && s.mvec_mode == 3 &&
+                             (fg_act || mgpu::gpu1::ui_ini_read("MVecEveryOther", 0) != 0) &&
+                             s.tex_mvec_keep != nullptr &&
                              s.mvec_keep_f != 0ull &&
                              f - s.mvec_keep_f <= (unsigned long long)mgpu::fgmap::reuse_window())
                     {
@@ -25523,10 +26138,12 @@ void stream_poll()
                         // through to R61's unset below.
                         s.nr_params->Set("DLSSNR.MVec", s.tex_mvec_keep);
                         mgpu::calibrator::override_scale(s.mvec_scale_x, s.mvec_scale_y);   // R105
+                        float sx_fg = s.mvec_scale_x, sy_fg = s.mvec_scale_y;               // R332
+                        if (s.mvec_scale_mul != 1.0f) { sx_fg *= s.mvec_scale_mul; sy_fg *= s.mvec_scale_mul; }
                         const float mv_k = mv_el * fg_frac;
-                        s.nr_params->Set("DLSSNR.MVecScaleX", s.mvec_scale_x * mv_k);
-                        s.nr_params->Set("DLSSNR.MVecScaleY", s.mvec_scale_y * mv_k);
-                        mgpu::calibrator::apply_jitter_offset(s.nr_params, s.mvec_scale_x, s.mvec_scale_y);   // R104
+                        s.nr_params->Set("DLSSNR.MVecScaleX", sx_fg * mv_k);
+                        s.nr_params->Set("DLSSNR.MVecScaleY", sy_fg * mv_k);
+                        mgpu::calibrator::apply_jitter_offset(s.nr_params, sx_fg, sy_fg);   // R104 / R332
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseX", p2r_in
                             ? (unsigned int)(((unsigned long long)rbx * s.mvec_w) / s.width) : 0u);
                         s.nr_params->Set("DLSSNR.MVecSubrectBaseY", p2r_in
@@ -25661,6 +26278,7 @@ void stream_poll()
                     if (p2f_here && s.p2f_fresh[fidx]) rst = 1u;           // R215
                     if (tdec.reset) rst = 1u;   // R300a1: TemporalResetK, off unless set
                     if (gate_rst) rst = 1u;     // R323: no history across frames the game's DLSS did not evaluate
+if (src_rst) rst = 1u;      // R331: the velocity source changed identity - do not reproject across it
                     s.nr_params->Set("DLSSNR.Reset", rst);
                     // [OURS] NRS: a feature rebuilt by a live scale change has no history;
                     // the first evaluate on it must discard whatever the module still has.

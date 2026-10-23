@@ -110,6 +110,7 @@
 #include "residual.hpp"   // R319a: one relaxed load, to word the x2 line
 #include "discovery.hpp"  // D1 (0.3.0 R&D): the discovery calibrator, off unless Discovery=1
 #include "live_panel.hpp"     // PanelOverPicture (N01950): own file, off unless PanelOverPicture=1
+#include "panel_simple.hpp"   // R351: the player-facing panel; its layout is panel_simple.txt
 #include "latency_probe.hpp"  // D1.5a (0.3.0 R&D): read-only latency probe, off unless LatencyProbe=1
 #include "journal.hpp"        // D2.0: what / when / why journal, off unless Journal=1
 #include "stall_watch.hpp"    // D2.0: stall watch, off unless StallWatch=N
@@ -217,6 +218,15 @@ static void on_init_device(reshade::api::device *device)
 // OwnReflex off the handler returns after one load. Declared here because
 // on_finish_present is defined beside on_present.
 static void on_finish_present(reshade::api::command_queue *, reshade::api::swapchain *swapchain);
+// R338 (2026-10-23): the live panel's present-event A/B unsubscribes and re-subscribes these two
+// from the overlay callback, so both handlers have to be visible up there.
+static void on_present(reshade::api::command_queue *queue,
+                       reshade::api::swapchain *swapchain,
+                       const reshade::api::rect *, const reshade::api::rect *,
+                       uint32_t, const reshade::api::rect *);
+// R338: the checkbox binds to this, and DllMain clears it when it honours Neural=0 by not
+// subscribing - so the box always shows what is actually subscribed.
+static bool g_present_events_on = true;
 
 static void mgpu_mvec_transport_hook(void *cmd_list_native, unsigned long long resource)
 {
@@ -1101,6 +1111,12 @@ static int mgpu_game_is_native(int *out_quality = nullptr)
 
 static void draw_mgpu_overlay(reshade::api::effect_runtime *)
 {
+    // R350 (answered 2026-10-23): CJK renders, but only through the font ReShade itself loaded.
+    // An add-on links ImGui through the function table only, which exposes no ImFontAtlas entry
+    // point - calling AddFontFromFileTTF here produced three LNK2019s. panel_simple.cpp therefore
+    // checks the loaded font for a CJK glyph and falls back to English labels when it is absent.
+
+
     // P7.10: THE UNSUPPORTED-API MESSAGE HAS TO LIVE HERE, and it is worth
     // saying why, because the obvious place was the bridge window's title and
     // that place cannot work. On a D3D11 or Vulkan title no D3D12 render device
@@ -1126,6 +1142,15 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
     // read at arm time, so a menu that gets armed out from under the reader is
     // a menu that does nothing.
     mgpu::gpu1::ui_panel_drawn();
+
+    // R351: the simple mode REPLACES the panel rather than greying parts of it out. `Advanced >>` at
+    // the bottom (and PanelSimple, and the editor section below) switch back. Everything the simple
+    // panel draws calls the same setters the full panel does - it is the same state, less on screen.
+    if (mgpu::psimple::enabled())
+    {
+        mgpu::psimple::draw_simple_panel();
+        return;
+    }
 
     mgpu::gpu1::ui_state st;
     mgpu::gpu1::ui_read(st);
@@ -1654,6 +1679,37 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
                      st.fps_produced, st.fps_consumed);
             ImGui::TextDisabled(lv);
         }
+
+        // R338 (2026-10-23). THE PRESENT-EVENT A/B, IN ONE SESSION.
+        //
+        // The cross-launch comparison could not resolve this: the same configuration read 75, 78 and
+        // 85 fps in three sessions (OBS #54), so the noise was larger than the effect. This box
+        // flips the two subscriptions while the game runs, from the render thread of the runtime
+        // being drawn - the same rule the P9.1 probe follows, and the only place register_event and
+        // unregister_event may be called. Untick it, read the counter, tick it again, read it again:
+        // same scene, same session, same everything else.
+        {
+            if (ImGui::Checkbox("present events (R338 A/B)", &g_present_events_on))
+            {
+                if (g_present_events_on)
+                {
+                    reshade::register_event<reshade::addon_event::present>(on_present);
+                    reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
+                    mgpu::diag::info("[MGPU][R338] present events REGISTERED again (same session) - the other "
+                                     "half of the A/B");
+                }
+                else
+                {
+                    reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
+                    reshade::unregister_event<reshade::addon_event::present>(on_present);
+                    mgpu::diag::info("[MGPU][R338] present events UNREGISTERED for this session: the add-on "
+                                     "stops being called on present. Nothing else changed.");
+                }
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("off = the inert half; read the game's own counter in both states");
+        }
+
         if (mgpu::t119::panel_stats())   // T1.17 (PanelStats=1): derived, not measured
         {
             snprintf(lv, sizeof lv, "frame interval (derived)   game %.2f ms   GPU 1 %.2f ms",
@@ -2758,6 +2814,8 @@ static void draw_mgpu_overlay(reshade::api::effect_runtime *)
             ImGui::TextDisabled("Watching only. Nothing is bound, nothing crosses the bus.");
         }
     }
+
+    mgpu::psimple::draw_editor();   // R351: toggle, open panel_simple.txt, export the row list
 
     ImGui::Separator();
     ImGui::TextDisabled("Do not change resolution, DLSS mode or presets while armed - disarm first.");
@@ -4093,6 +4151,10 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // PanelOverPicture (N01950): reads its key once and registers its
         // reshade_overlay event only when PanelOverPicture=1 (live_panel.cpp).
         mgpu::live_panel::attach(hModule);
+        // R351: the simple panel's layout file lives beside the add-on. init() remembers the
+        // directory and reads panel_simple.txt; nothing else about the panel changes until the key
+        // is set, so a launch without the file behaves exactly as before.
+        mgpu::psimple::init(hModule);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse
         reshade::register_event<reshade::addon_event::create_swapchain>(on_create_swapchain);           // R242
@@ -4105,11 +4167,33 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // L3: see stream_on_present. Registered unconditionally; the add-on
         // side decides whether to act on it, so the ini can turn the behaviour
         // on and off without a rebuild.
-        reshade::register_event<reshade::addon_event::present>(on_present);
-        // D2.0: after the game's Present. Registered here with every other
-        // event (registering later, from a render thread, races ReShade's
-        // unsynchronised event list). Off: the handler returns after a load.
-        reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
+        //
+        // R337 (2026-10-23). EXCEPT WHEN THERE IS NOTHING TO PRESENT. With Neural=0 the add-on has
+        // no neural frame and no transport, yet it still subscribed to present/finish_present, so
+        // ReShade dispatched into this module on every game present and the bridge ran its (empty)
+        // present chain on top. The "inert add-on" measurement - 85 fps with Neural=0 against 98
+        // with the add-on renamed away - is exactly what that costs, and it is the one number that
+        // decides whether the present path or the event dispatch is the price of being an add-on.
+        // With Neural=0 the two subscriptions are now NOT made, i.e. this launch really is inert.
+        {
+            const bool neural_stage = mgpu::gpu1::ui_ini_read("Neural", 1) != 0;
+            if (neural_stage)
+            {
+                reshade::register_event<reshade::addon_event::present>(on_present);
+                // D2.0: after the game's Present. Registered here with every other
+                // event (registering later, from a render thread, races ReShade's
+                // unsynchronised event list). Off: the handler returns after a load.
+                reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
+            }
+            else
+            {
+                g_present_events_on = false;   // R338: the panel checkbox reads this
+                mgpu::diag::info("[MGPU][R337] Neural=0: present and finish_present are NOT registered, so this "
+                                 "launch is an inert add-on - the control for what the present path itself costs. "
+                                 "Set Neural=1 to restore them. The panel's R338 box starts unticked and can "
+                                 "subscribe them again without a restart.");
+            }
+        }
         // V65: the bridge steps aside while the game's overlay is open.
         reshade::register_event<reshade::addon_event::reshade_open_overlay>(
             on_reshade_open_overlay);
