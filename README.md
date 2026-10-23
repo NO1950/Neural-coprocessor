@@ -5,7 +5,9 @@
 > 本仓库是 **maohgad-web/Neural-coprocessor 的个人分支**，基于作者 **0.4.0**（提交 `69d6e9d`）加上我们自己的改动。
 > 主项目、原始文档与发布包在作者仓库：<https://github.com/maohgad-web/Neural-coprocessor>
 >
-> 另外两份中文文档：[`KEYS_AND_RISKS_ZH.md`](KEYS_AND_RISKS_ZH.md)（每个键的意思与风险）、
+> 中文文档：
+> [`TRAPS_AND_FIXES_ZH.md`](TRAPS_AND_FIXES_ZH.md)（**踩过的坑与解决方案大全**，含 ER/CP2077/KCD2/BO3/FC6）、
+> [`KEYS_AND_RISKS_ZH.md`](KEYS_AND_RISKS_ZH.md)（每个键的意思与改错的后果）、
 > [`BRANCH_GUIDE_ZH.md`](BRANCH_GUIDE_ZH.md)（分支操作）。
 >
 > 说明：本分支的中文文档由 AI 起草、人工核对内容；语气可能偏正式，见谅。
