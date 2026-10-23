@@ -14,6 +14,13 @@ project(mgpu_bridge CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The simple panel's labels are Chinese, so the source must be read AND emitted as UTF-8;
+# without this MSVC takes the bytes in the system code page and the labels reach ImGui as
+# mojibake (ImGui expects UTF-8, which is what /utf-8 produces).
+if (MSVC)
+    add_compile_options(/utf-8)
+endif()
+
 # Source list follows the closed manifest (P0_RECORD.md, section 01):
 # T2 adds diag/adapter, T3 adds worker/gpu1_context. runtime_probe lands
 # with its own task; assets/ is deployed by hand and never compiled.
@@ -92,6 +99,7 @@ add_library(mgpu_bridge SHARED
     # PanelOverPicture (N01950): the live panel over the neural frame. OFF unless
     # PanelOverPicture=1; registers its own ReShade event only then.
     src/live_panel.cpp
+    src/panel_simple.cpp   # the player-facing panel; its layout lives in panel_simple.txt
     # R300 - T1.19 (Dom / LordZaxxon), docs/R300_T119.md. Every path OFF unless its mgpu.ini key is set:
     # t119_keys.cpp is the one place the keys are read (from probe's ini read).
     src/t119_keys.cpp

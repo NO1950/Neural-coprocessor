@@ -42,6 +42,7 @@
 #include "adapter.hpp"
 #include "diag.hpp"
 #include "gpu1_context.hpp"
+#include "panel_simple.hpp"   // the simple-panel hotkey below
 #include "startup_trace.hpp"   // R313
 #include "worker.hpp"
 
@@ -81,6 +82,9 @@
 // not "no regression".
 // F6 and not F12 because Steam's screenshot key is F12.
 #define MGPU_HOTKEY_PEEK       0x4D50   // CTRL+ALT+F6
+// The simple panel. F4 because F5/F9 are quick save/load on several titles, F6-F11 are taken by
+// the keys above, and F12 belongs to Steam.
+#define MGPU_HOTKEY_SIMPLE     0x4D51   // CTRL+ALT+F4 - full panel <-> simple panel
 
 namespace mgpu { HMODULE module_handle(); }
 
@@ -782,6 +786,17 @@ namespace
                                 mgpu::gpu1::dcomp_overlay_mode() &&
                                 RegisterHotKey(nullptr, MGPU_HOTKEY_PEEK,
                                     MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F6) != FALSE;
+                            // Registered independently of the peek key, like every other
+                            // hotkey here: one failing must not cost the others.
+                            const bool k_s = RegisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE,
+                                                MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F4) != FALSE;
+                            if (k_s)
+                                mgpu::diag::info("[MGPU][R351b] simple panel hotkey: CTRL+ALT+F4 switches the "
+                                                 "panel between the full view and the simple one. It writes "
+                                                 "PanelSimple to mgpu.ini, so the choice survives a restart.");
+                            else
+                                mgpu::diag::warn("[MGPU][R351b] simple panel hotkey CTRL+ALT+F4 FAILED to "
+                                                 "register - the checkbox in the full panel still switches it.");
                             if (mgpu::gpu1::dcomp_overlay_mode())
                             {
                                 char pk[440];
@@ -1055,6 +1070,10 @@ namespace
                     // the key is not registered there.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
                     { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
+                    // The panel draws its next frame from the key, so this is immediate and
+                    // needs neither a restart nor the panel to be open.
+                    if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SIMPLE)
+                    { mgpu::psimple::set_enabled(!mgpu::psimple::enabled()); continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
                     { ++view_cycles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
@@ -1570,6 +1589,7 @@ namespace
             // V52: only ever registered in ghost mode.
             if (mgpu::gpu1::dcomp_overlay_mode())
                 UnregisterHotKey(nullptr, MGPU_HOTKEY_PEEK);
+            UnregisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_L);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_R);
             UnregisterHotKey(nullptr, MGPU_HOTKEY_SEAM_LC);
