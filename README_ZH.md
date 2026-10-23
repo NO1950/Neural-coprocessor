@@ -1,4 +1,4 @@
-﻿# Neural Coprocessor · 中文分支（MGPU Bridge）
+# Neural Coprocessor · 中文分支（MGPU Bridge）
 
 > 这是 **maohgad-web/Neural-coprocessor 的个人分支**，基于作者 **0.4.0**（提交 `69d6e9d`）加上我们自己的改动。
 > 主项目、原始文档与发布包在作者仓库：<https://github.com/maohgad-web/Neural-coprocessor>
@@ -22,17 +22,23 @@
 
 ## 本分支比作者原版多了什么
 
-| 功能 | 键 | 默认 | 说明 |
+| 功能 | 键 | 本分支默认 | 说明 |
 |---|---|---|---|
-| **中文精简面板** | `PanelSimple=1` / **CTRL+ALT+F4** | 关 | 只显示可调参数，隐藏日志与计数；布局写在 `panel_simple.txt`，可自己改 |
-| **隔帧运动向量拷贝** | `MVecEveryOther=2` | 关（`0`/`1`） | 运动向量每 2 帧拷 1 次、另一帧复用；FC6 4K 实测 **70 → 75 帧（+7.1%）**，无明显拖影 |
-| 呈现限速（仪器） | `PresentMaxFps=N` | 关 | 未武装时 present 循环会空转（240–489 次/秒），这是给它加的上限；**不提升帧率**，只用于测量 |
-| 拷贝/等待判别（仪器） | `MVecCopyOnly=1` | 关 | 拷贝照跑、神经端拿零向量场。用来测"拷贝本身 vs 等待"的成本 |
-| 半分辨率向量（已否决） | `MVecHalf=1`、`MVecReconstruct=1` | 关 | 省 3/4 带宽但**画面变糊**（含静态菜单），实测两次否决，仅留作实验键 |
+| **中文精简面板** | `PanelSimple` / **CTRL+ALT+F4** | **开（1）** | 只显示可调参数，隐藏日志与计数；布局写在 `panel_simple.txt`，可自己改 |
+| 面板画在神经画面上 | `PanelOverPicture` | **开（1）** | Home 直接盖在神经层，而不是退回原生画面 |
+| 面板信息与高度 | `PanelStats` / `PanelAutoHeight` | **开（1）** | 游戏呈现节奏 / 自适应高度 |
+| 画风键总开关 | `Tuning` | **开（1）** | 才读取 `Style / Tone / Structure / Skin` |
+| **隔帧运动向量拷贝** | `MVecEveryOther=N` | **关（0）** | 每 N 帧只拷 1 次向量；FC6 4K 实测 `2` = **70 → 75 帧（+7.1%）**，无明显拖影。默认关，因为这是画质/帧率的取舍项 |
+| 呈现限速（仪器） | `PresentMaxFps=N` | 关 | 未武装时 present 会空转（240–489 次/秒），这是给它加的上限；**不提升帧率** |
+| 拷贝/等待判别（仪器） | `MVecCopyOnly=1` | 关 | 拷贝照跑、神经端拿零向量场，用来测"拷贝本身 vs 等待"的成本 |
+| 半分辨率向量（已否决） | `MVecHalf`、`MVecReconstruct` | 关 | 省 3/4 带宽但**画面变糊**（含静态菜单），实测两次否决 |
 | 按需拷贝（已否决） | `MVecCopyOnDemand=1` | 关 | 消费端只评估最新帧，生产端无法预知，会饿死车道 |
 | 面板内 present A/B（诊断） | 面板勾选框 | 勾选 | 注销 present 会让面板/热键失效，仅用于确认"present 分发是承重的" |
 
-> 以上开关**全部默认关闭**，不设置时行为与作者 0.4.0 完全一致。
+> 除上表标"开"的几项外，其余开关默认关闭。
+> **每个键的意思、改错会有什么后果、遇到问题该改哪一项 → 见 [`KEYS_AND_RISKS_ZH.md`](KEYS_AND_RISKS_ZH.md)。**
+
+> 注意：`Depth=1`（本分支与上游一致）要求 ReShade preset 里启用 **`MGPU_DepthTap`**，否则神经端拿不到深度，面板会提示 `Depth=1 needs MGPU_DepthTap`。
 
 ---
 
