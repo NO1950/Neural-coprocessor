@@ -1,6 +1,7 @@
 # Neural Coprocessor · 中文分支（MGPU Bridge）
 
-> **这是中文说明（本文件就是仓库首页的 README）。英文原版见 [`README_en.md`](README_en.md)。**
+> **这是中文说明（本文件就是仓库首页的 README）。**
+> **英文翻译版见 [`README_EN.md`](README_EN.md)；作者原始 README 见 [`README_original.md`](README_original.md)。**
 >
 > 本仓库是 **maohgad-web/Neural-coprocessor 的个人分支**，基于作者 **0.4.0**（提交 `69d6e9d`）加上我们自己的改动。
 > 主项目、原始文档与发布包在作者仓库：<https://github.com/maohgad-web/Neural-coprocessor>
