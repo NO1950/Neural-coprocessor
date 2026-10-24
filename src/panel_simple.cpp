@@ -19,7 +19,15 @@
 // has no CJK glyphs the panel falls back to the English label automatically, so a player who never
 // touches ReShade.ini still gets a usable panel instead of boxes.
 //
-// Log tags: [R351] init/file, [R352] mode switch, [R353] unknown id.
+// Log tag: [R330] (init / file, mode switch, unknown id). R330 is the merge of N01950's commit;
+// every later squashed commit on this work is a letter on it: R330, R330, ... (one letter per
+// commit). The merge also carries the review fixes: PanelSimple is held here, not in ui_ini_read's
+// 12-slot mirror; the hotkey acts after the bridge thread's message drain (worker.cpp); the full
+// panel's install-layout warning is drawn in the simple panel too; "export items" and the
+// registered count work before the simple panel was ever drawn.
+//
+// THREADS (R330, F1). The layout (g_layout, g_by_id, g_rows) is read and rebuilt ONLY on the render
+// thread, from the overlay's draw. toggle() - the bridge thread's hotkey - touches the ini only.
 
 #include "panel_simple.hpp"
 
@@ -31,6 +39,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <atomic>
 
 // Same rule as dllmain: imgui.h has to come first so reshade.hpp binds the ImGui function table, and
 // ImTextureID must be ReShade's 64-bit handle. Guarded so a build without the headers still compiles
@@ -45,7 +54,7 @@
 
 #include <reshade.hpp>          // the ImGui wrappers (function table), as everywhere else
 #include "gpu1_context.hpp"     // ui_ini_read / ui_ini_write / ui_nrs_* / ui_read
-#include "fg_map.hpp"           // R351d: frame-generation mode/keep are live only through fgmap
+#include "fg_map.hpp"           // R330: frame-generation mode/keep are live only through fgmap
 #include "diag.hpp"
 
 namespace mgpu::psimple
@@ -57,7 +66,7 @@ namespace mgpu::psimple
             std::string id;
             std::string zh;      // Chinese label, empty = use the code's English one
             std::string help;    // \n allowed, expanded when drawn
-            // R351e: a line that starts with '=' is a SECTION HEADER, not a control. Its text is the
+            // R330: a line that starts with '=' is a SECTION HEADER, not a control. Its text is the
             // title drawn with SeparatorText, and the rows that follow it belong to that section. An
             // empty banner (just '======') draws a plain separator.
             bool        header = false;
@@ -70,25 +79,52 @@ namespace mgpu::psimple
             draw_fn     fn = nullptr;
         };
 
-        std::string              g_dir;              // the add-on's directory, trailing backslash
+        std::wstring             g_dir;              // the add-on's directory, trailing backslash (R330, F3: wide)
         std::vector<entry>       g_layout;           // as the file has it, in order
         std::vector<row_def>     g_rows;             // registered drawers, in code order
         std::map<std::string, entry> g_by_id;        // lookup for labels/help
         unsigned long long       g_file_mtime = 0;
+        // R330: the PanelSimple key, held here. -1 = not read yet; 0 / 1 = the file's value, then
+        // whatever set_enabled() last wrote. ui_ini_read is deliberately NOT used: its mirror has 12
+        // slots, the full panel already uses most of them, and a full mirror re-reads mgpu.ini every
+        // frame for every key it could not cache. Read and written from the file directly instead.
+        std::atomic<int>         g_simple{ -1 };
+
+        int simple_flag()
+        {
+            int v = g_simple.load(std::memory_order_relaxed);
+            if (v >= 0) return v;
+            char w[16];
+            mgpu::gpu1::ui_ini_read_word("PanelSimple", w, sizeof w);   // the file itself, no mirror slot
+            v = (w[0] == '1') ? 1 : 0;
+            g_simple.store(v, std::memory_order_relaxed);
+            return v;
+        }
         bool                     g_tried_load = false;
         std::vector<std::string> g_reported;         // ids already complained about
 
-        std::string path_of(const char *name)
+        std::wstring path_of(const wchar_t *name)
         {
-            std::string p = g_dir;
+            std::wstring p = g_dir;
             p += name;
             return p;
         }
 
-        bool read_file(const std::string &path, std::string &out)
+        // For log lines only: the wide path as UTF-8.
+        std::string narrow(const std::wstring &w)
+        {
+            if (w.empty()) return std::string();
+            const int n = WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), nullptr, 0, nullptr, nullptr);
+            if (n <= 0) return std::string();
+            std::string out((size_t)n, '\0');
+            WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &out[0], n, nullptr, nullptr);
+            return out;
+        }
+
+        bool read_file(const std::wstring &path, std::string &out)
         {
             FILE *f = nullptr;
-            if (fopen_s(&f, path.c_str(), "rb") != 0 || f == nullptr) return false;
+            if (_wfopen_s(&f, path.c_str(), L"rb") != 0 || f == nullptr) return false;
             fseek(f, 0, SEEK_END);
             const long n = ftell(f);
             fseek(f, 0, SEEK_SET);
@@ -100,10 +136,10 @@ namespace mgpu::psimple
             return true;
         }
 
-        unsigned long long mtime_of(const std::string &path)
+        unsigned long long mtime_of(const std::wstring &path)
         {
             WIN32_FILE_ATTRIBUTE_DATA d{};
-            if (!GetFileAttributesExA(path.c_str(), GetFileExInfoStandard, &d)) return 0;
+            if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &d)) return 0;
             return ((unsigned long long)d.ftLastWriteTime.dwHighDateTime << 32) | d.ftLastWriteTime.dwLowDateTime;
         }
 
@@ -132,7 +168,7 @@ namespace mgpu::psimple
                     line.erase(0, 3);
                 line = trim(line);
                 if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-                // R351e: a banner is a header. '==== 模型 / 画风 ====' becomes a section title, and an
+                // R330: a banner is a header. '==== 模型 / 画风 ====' becomes a section title, and an
                 // empty '======' becomes a plain separator. The '=' runs are stripped from both ends,
                 // so the operator writes the title once, the way the commented banners already read.
                 if (line[0] == '=')
@@ -171,9 +207,16 @@ namespace mgpu::psimple
             }
         }
 
+        // R330 (F6): is panel_simple.txt beside the add-on? A stat, no read, no log line.
+        bool file_present()
+        {
+            return !g_dir.empty() && mtime_of(path_of(L"panel_simple.txt")) != 0ull;
+        }
+
         void load_if_changed(bool force)
         {
-            const std::string p = path_of("panel_simple.txt");
+            if (g_dir.empty()) return;
+            const std::wstring p = path_of(L"panel_simple.txt");
             const unsigned long long mt = mtime_of(p);
             if (!force && g_tried_load && mt == g_file_mtime) return;
             g_tried_load = true;
@@ -184,16 +227,16 @@ namespace mgpu::psimple
                 g_layout.clear();
                 g_by_id.clear();
                 char l[400];
-                snprintf(l, sizeof l, "[MGPU][R351] panel_simple.txt not found at %s - the simple panel will "
+                snprintf(l, sizeof l, "[MGPU][R330] panel_simple.txt not found at %s - the simple panel will "
                                       "show nothing. Use 'export items' in the full panel to write a template.",
-                         p.c_str());
+                         narrow(p).c_str());
                 mgpu::diag::warn(l);
                 return;
             }
             parse(text);
             char l[320];
-            snprintf(l, sizeof l, "[MGPU][R351] panel_simple.txt: %u row(s) in the layout (%s)",
-                     (unsigned)g_layout.size(), p.c_str());
+            snprintf(l, sizeof l, "[MGPU][R330] panel_simple.txt: %u row(s) in the layout (%s)",
+                     (unsigned)g_layout.size(), narrow(p).c_str());
             mgpu::diag::info(l);
         }
 
@@ -210,7 +253,7 @@ namespace mgpu::psimple
                 if (s == id) return;
             g_reported.push_back(id);
             char l[320];
-            snprintf(l, sizeof l, "[MGPU][R353] panel_simple.txt names '%s' but %s - that line is skipped.",
+            snprintf(l, sizeof l, "[MGPU][R330] panel_simple.txt names '%s' but %s - that line is skipped.",
                      id.c_str(), why);
             mgpu::diag::warn(l);
         }
@@ -231,18 +274,14 @@ namespace mgpu::psimple
 
     void init(HMODULE mod)
     {
+        // R330 (F2): runs inside DllMain, so it only remembers the directory - no file read, no log line.
+        // The file is read on the first panel draw that needs it (enabled() with the key set, or the
+        // editor section when the file is present).
         wchar_t p[MAX_PATH]{};
         if (GetModuleFileNameW(mod, p, MAX_PATH) == 0) return;
         wchar_t *slash = wcsrchr(p, L'\\');
         if (slash != nullptr) *(slash + 1) = 0;
-        char narrow[MAX_PATH * 2]{};
-        WideCharToMultiByte(CP_UTF8, 0, p, -1, narrow, (int)sizeof narrow - 1, nullptr, nullptr);
-        g_dir = narrow;
-        load_if_changed(true);
-        char l[400];
-        snprintf(l, sizeof l, "[MGPU][R351] simple panel ready: directory %s, %u layout row(s)",
-                 g_dir.c_str(), (unsigned)g_layout.size());
-        mgpu::diag::info(l);
+        g_dir = p;
     }
 
 #ifdef MGPU_HAVE_IMGUI
@@ -255,17 +294,30 @@ namespace mgpu::psimple
 
     bool enabled()
     {
+        // R330 (F1, F2): called on the render thread only. The key is read first, so with PanelSimple
+        // unset nothing is read from disk and nothing is logged.
+        if (simple_flag() == 0) return false;   // R330
         load_if_changed(false);
-        return mgpu::gpu1::ui_ini_read("PanelSimple", 0) != 0 && !g_layout.empty();
+        return !g_layout.empty();
     }
 
     void set_enabled(bool on)
     {
-        mgpu::gpu1::ui_ini_write("PanelSimple", on ? 1 : 0);
+        // R330: the word writer, not ui_ini_write - the latter would put the key into the mirror.
+        (void)mgpu::gpu1::ui_ini_write_word("PanelSimple", on ? "1" : "0");
+        g_simple.store(on ? 1 : 0, std::memory_order_relaxed);
         char l[200];
-        snprintf(l, sizeof l, "[MGPU][R352] PanelSimple=%d (%s mode)", on ? 1 : 0,
+        snprintf(l, sizeof l, "[MGPU][R330] PanelSimple=%d (%s mode)", on ? 1 : 0,
                  on ? "simple" : "full");
         mgpu::diag::info(l);
+    }
+
+    void toggle()
+    {
+        // R330 (F1): the hotkey's path. Flips the flag (R330: read from the file once if nobody has
+        // yet) and writes it back; the layout is not touched here, so this is safe from the bridge
+        // thread. R330: worker.cpp calls this after its message drain, never inside it.
+        set_enabled(simple_flag() == 0);
     }
 
     void reload() { load_if_changed(true); }
@@ -323,21 +375,24 @@ namespace mgpu::psimple
 
     void open_editor()
     {
-        const std::string p = path_of("panel_simple.txt");
-        const std::wstring wp(p.begin(), p.end());
+        const std::wstring p = path_of(L"panel_simple.txt");
         // notepad is always there; the file's own association is deliberately not used so this works
-        // on a machine where .txt is bound to something modal.
-        ShellExecuteW(nullptr, L"open", L"notepad.exe", wp.c_str(), nullptr, SW_SHOWNORMAL);
-        mgpu::diag::info("[MGPU][R351] opened panel_simple.txt in notepad");
+        // on a machine where .txt is bound to something modal. R330 (F3): the real wide path, quoted.
+        const std::wstring arg = L"\"" + p + L"\"";
+        ShellExecuteW(nullptr, L"open", L"notepad.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
+        mgpu::diag::info("[MGPU][R330] opened panel_simple.txt in notepad");
     }
+
+    namespace { void register_rows(); }   // defined with the rows below
 
     void export_items()
     {
-        const std::string p = path_of("panel_simple_items.txt");
+        register_rows();   // R330: the list exists before the simple panel was ever drawn
+        const std::wstring p = path_of(L"panel_simple_items.txt");
         FILE *f = nullptr;
-        if (fopen_s(&f, p.c_str(), "wb") != 0 || f == nullptr)
+        if (_wfopen_s(&f, p.c_str(), L"wb") != 0 || f == nullptr)
         {
-            mgpu::diag::warn("[MGPU][R351] could not write panel_simple_items.txt");
+            mgpu::diag::warn("[MGPU][R330] could not write panel_simple_items.txt");
             return;
         }
         // A template the operator can copy lines out of: every registered row with its English name
@@ -349,8 +404,39 @@ namespace mgpu::psimple
             fprintf(f, "%-18s | %s | \n", r.id.c_str(), r.en.c_str());
         fclose(f);
         char l[320];
-        snprintf(l, sizeof l, "[MGPU][R351] wrote %u row(s) to %s", (unsigned)g_rows.size(), p.c_str());
+        snprintf(l, sizeof l, "[MGPU][R330] wrote %u row(s) to %s", (unsigned)g_rows.size(), narrow(p).c_str());
         mgpu::diag::info(l);
+    }
+
+    // ---------------------------------------------------------------------
+    // R330 (F4): the labels INSIDE the rows (buttons, radio choices, slider text) come from the file
+    // like the row labels: a `ui.<name> | label` line, shown when the font has CJK glyphs, English
+    // otherwise. A missing line shows the English text. `ui.*` lines are labels, not rows.
+    // ---------------------------------------------------------------------
+    namespace
+    {
+        std::string T(const char *key, const char *en)
+        {
+            const char *z = cjk() ? zh(key) : nullptr;
+            return std::string(z != nullptr ? z : en);
+        }
+        // T + an ImGui id suffix, for button / radio / checkbox labels.
+        std::string L(const char *key, const char *en, const char *id)
+        {
+            std::string s = T(key, en);
+            s += "##";
+            s += id;
+            return s;
+        }
+        // T made safe as a printf format: a '%' typed in the file is doubled.
+        std::string F(const char *key, const char *en)
+        {
+            const std::string t = T(key, en);
+            std::string out;
+            out.reserve(t.size() + 4);
+            for (char c : t) { out.push_back(c); if (c == '%') out.push_back('%'); }
+            return out;
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -371,7 +457,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##nrs_scale", &sc, 0.30f, top, "%.2f"))
                 mgpu::gpu1::ui_nrs_stage(sc);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##nrs_scale")) mgpu::gpu1::ui_nrs_stage(0.75f);
+            if (ImGui::SmallButton(L("ui.default", "default", "nrs_scale").c_str())) mgpu::gpu1::ui_nrs_stage(0.75f);
         }
 
         void row_nrs_gain()
@@ -384,7 +470,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##nrs_gain", &v, 0.0f, 2.0f, "%.2f"))
                 mgpu::gpu1::ui_nrs_set(0, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##nrs_gain")) mgpu::gpu1::ui_nrs_set(0, 1.00f);
+            if (ImGui::SmallButton(L("ui.default", "default", "nrs_gain").c_str())) mgpu::gpu1::ui_nrs_set(0, 1.00f);
         }
 
         void row_nrs_sharp()
@@ -397,7 +483,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##nrs_sharp", &v, 0.0f, 1.0f, "%.2f"))
                 mgpu::gpu1::ui_nrs_set(1, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##nrs_sharp")) mgpu::gpu1::ui_nrs_set(1, 0.50f);
+            if (ImGui::SmallButton(L("ui.default", "default", "nrs_sharp").c_str())) mgpu::gpu1::ui_nrs_set(1, 0.50f);
         }
 
         void row_nrs_colour()
@@ -410,7 +496,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##nrs_col", &v, 0.0f, 1.0f, "%.2f"))
                 mgpu::gpu1::ui_nrs_set(2, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##nrs_col")) mgpu::gpu1::ui_nrs_set(2, 0.90f);
+            if (ImGui::SmallButton(L("ui.default", "default", "nrs_col").c_str())) mgpu::gpu1::ui_nrs_set(2, 0.90f);
         }
 
         void row_nrs_mode()
@@ -419,12 +505,12 @@ namespace mgpu::psimple
             mgpu::gpu1::ui_read(st);
             if (!st.nrs_on) { ImGui::TextDisabled("-"); return; }
             int mo = (int)st.nrs_mode;
-            if (ImGui::RadioButton("残差##nrs_mode", mo == 1)) mgpu::gpu1::ui_nrs_set(3, 1.0f);
+            if (ImGui::RadioButton(L("ui.residual", "residual", "nrs_mode1").c_str(), mo == 1)) mgpu::gpu1::ui_nrs_set(3, 1.0f);
             ImGui::SameLine();
-            if (ImGui::RadioButton("直接##nrs_mode", mo == 0)) mgpu::gpu1::ui_nrs_set(3, 0.0f);
+            if (ImGui::RadioButton(L("ui.direct", "direct", "nrs_mode0").c_str(), mo == 0)) mgpu::gpu1::ui_nrs_set(3, 0.0f);
         }
 
-        // ---- R351b: the rows a player may also want, all live setters ----
+        // ---- R330: the rows a player may also want, all live setters ----
         void row_passes()
         {
             mgpu::gpu1::ui_state st;
@@ -439,14 +525,14 @@ namespace mgpu::psimple
         {
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
-            // R351f: index 0 is the full panel's "all passes" - it distributes across every pass. The
+            // R330: index 0 is the full panel's "all passes" - it distributes across every pass. The
             // first cut used 1 (pass 1 only), which silently ignored pass 2 whenever x2 was on.
             float v = st.intensity[0];
             ImGui::SetNextItemWidth(190.0f);
             if (ImGui::SliderFloat("##intensity", &v, 0.0f, 2.0f, "%.2f"))
                 mgpu::gpu1::ui_set_intensity(0, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##intensity")) mgpu::gpu1::ui_set_intensity(0, 2.00f);
+            if (ImGui::SmallButton(L("ui.default", "default", "intensity").c_str())) mgpu::gpu1::ui_set_intensity(0, 2.00f);
         }
 
         void row_view()
@@ -454,16 +540,16 @@ namespace mgpu::psimple
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
             int pm = st.present_mode;
-            if (ImGui::RadioButton("输出##view", pm == 0)) mgpu::gpu1::ui_set_present_mode(0);
+            if (ImGui::RadioButton(L("ui.output", "output", "view0").c_str(), pm == 0)) mgpu::gpu1::ui_set_present_mode(0);
             ImGui::SameLine();
-            if (ImGui::RadioButton("输入##view", pm == 1)) mgpu::gpu1::ui_set_present_mode(1);
+            if (ImGui::RadioButton(L("ui.input", "input", "view1").c_str(), pm == 1)) mgpu::gpu1::ui_set_present_mode(1);
             ImGui::SameLine();
-            if (ImGui::RadioButton("分屏##view", pm == 2)) mgpu::gpu1::ui_set_present_mode(2);
+            if (ImGui::RadioButton(L("ui.split", "split", "view2").c_str(), pm == 2)) mgpu::gpu1::ui_set_present_mode(2);
             if (pm == 2)
             {
                 float sp = st.split_pos;
                 ImGui::SetNextItemWidth(190.0f);
-                if (ImGui::SliderFloat("##seam", &sp, 0.0f, 1.0f, "分界 %.2f"))
+                if (ImGui::SliderFloat("##seam", &sp, 0.0f, 1.0f, (F("ui.seam", "seam") + " %.2f").c_str()))
                     mgpu::gpu1::ui_set_split_pos(sp);
             }
         }
@@ -481,14 +567,14 @@ namespace mgpu::psimple
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
             int m = st.mvec_mode;
-            if (ImGui::RadioButton("关##mvecmode", m == 0)) mgpu::gpu1::ui_set_mvec_mode(0);
+            if (ImGui::RadioButton(L("ui.off", "off", "mvecmode0").c_str(), m == 0)) mgpu::gpu1::ui_set_mvec_mode(0);
             ImGui::SameLine();
-            if (ImGui::RadioButton("合成##mvecmode", m == 1)) mgpu::gpu1::ui_set_mvec_mode(1);
+            if (ImGui::RadioButton(L("ui.synthetic", "synthetic", "mvecmode1").c_str(), m == 1)) mgpu::gpu1::ui_set_mvec_mode(1);
             ImGui::SameLine();
-            if (ImGui::RadioButton("真实##mvecmode", m == 3)) mgpu::gpu1::ui_set_mvec_mode(3);
+            if (ImGui::RadioButton(L("ui.real", "real", "mvecmode3").c_str(), m == 3)) mgpu::gpu1::ui_set_mvec_mode(3);
         }
 
-        // ---- R351c: the model group, the preset curves and the two keys that need a re-arm ----
+        // ---- R330: the model group, the preset curves and the two keys that need a re-arm ----
         void row_model_style()
         {
             mgpu::gpu1::ui_state st;
@@ -510,7 +596,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##tone", &v, 0.0f, 2.0f, "%.2f"))
                 mgpu::gpu1::ui_set_tuning_value(0, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##tone")) mgpu::gpu1::ui_set_tuning_value(0, 1.00f);
+            if (ImGui::SmallButton(L("ui.default", "default", "tone").c_str())) mgpu::gpu1::ui_set_tuning_value(0, 1.00f);
         }
 
         void row_model_structure()
@@ -522,7 +608,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##structure", &v, 0.0f, 2.0f, "%.2f"))
                 mgpu::gpu1::ui_set_tuning_value(1, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##structure")) mgpu::gpu1::ui_set_tuning_value(1, 1.00f);
+            if (ImGui::SmallButton(L("ui.default", "default", "structure").c_str())) mgpu::gpu1::ui_set_tuning_value(1, 1.00f);
         }
 
         void row_model_skin()
@@ -534,7 +620,7 @@ namespace mgpu::psimple
             if (ImGui::SliderFloat("##skin", &v, 0.0f, 2.0f, "%.2f"))
                 mgpu::gpu1::ui_set_tuning_value(2, v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("默认##skin")) mgpu::gpu1::ui_set_tuning_value(2, 1.00f);
+            if (ImGui::SmallButton(L("ui.default", "default", "skin").c_str())) mgpu::gpu1::ui_set_tuning_value(2, 1.00f);
         }
 
         void row_model_mask()
@@ -550,14 +636,14 @@ namespace mgpu::psimple
             mgpu::gpu1::ui_state st;
             mgpu::gpu1::ui_read(st);
             int p = st.preset;
-            if (ImGui::RadioButton("手动##preset", p == 0)) mgpu::gpu1::ui_set_preset(0);
+            if (ImGui::RadioButton(L("ui.manual", "manual", "preset0").c_str(), p == 0)) mgpu::gpu1::ui_set_preset(0);
             ImGui::SameLine();
-            if (ImGui::RadioButton("前置##preset", p == 1)) mgpu::gpu1::ui_set_preset(1);
+            if (ImGui::RadioButton(L("ui.front", "front", "preset1").c_str(), p == 1)) mgpu::gpu1::ui_set_preset(1);
             ImGui::SameLine();
-            if (ImGui::RadioButton("后置##preset", p == 2)) mgpu::gpu1::ui_set_preset(2);
+            if (ImGui::RadioButton(L("ui.back", "back", "preset2").c_str(), p == 2)) mgpu::gpu1::ui_set_preset(2);
         }
 
-        // R351h: one slider, 0 = off. The checkbox that used to sit here read as "an empty box and a
+        // R330: one slider, 0 = off. The checkbox that used to sit here read as "an empty box and a
         // number", which is exactly the ambiguity the simple panel is meant to remove.
         void row_frame_cap()
         {
@@ -566,7 +652,7 @@ namespace mgpu::psimple
             if (ImGui::SliderInt("##capfps", &v, 0, 240, (v == 0) ? "off" : "%d"))
                 (void)mgpu::gpu1::ui_ini_write("FrameCap", v);
             ImGui::SameLine();
-            if (ImGui::SmallButton("关闭##cap_zero")) (void)mgpu::gpu1::ui_ini_write("FrameCap", 0);
+            if (ImGui::SmallButton(L("ui.turn_off", "off", "cap_zero").c_str())) (void)mgpu::gpu1::ui_ini_write("FrameCap", 0);
         }
 
         void row_colour16()
@@ -581,23 +667,23 @@ namespace mgpu::psimple
             const int mode = mgpu::gpu1::ui_ini_read("ScaleMode", 0);
             const int auto_crop = mgpu::gpu1::ui_ini_read("CropAuto", 1);
             const int cur = (mode == 0) ? 0 : (auto_crop != 0 ? 2 : 1);
-            if (ImGui::RadioButton("关##crop", cur == 0))
+            if (ImGui::RadioButton(L("ui.off", "off", "crop0").c_str(), cur == 0))
                 (void)mgpu::gpu1::ui_ini_write("ScaleMode", 0);
             ImGui::SameLine();
-            if (ImGui::RadioButton("开##crop", cur == 1))
+            if (ImGui::RadioButton(L("ui.on", "on", "crop1").c_str(), cur == 1))
             {
                 (void)mgpu::gpu1::ui_ini_write("CropAuto", 0);
                 (void)mgpu::gpu1::ui_ini_write("ScaleMode", 1);
             }
             ImGui::SameLine();
-            if (ImGui::RadioButton("自动##crop", cur == 2))
+            if (ImGui::RadioButton(L("ui.auto", "auto", "crop2").c_str(), cur == 2))
             {
                 (void)mgpu::gpu1::ui_ini_write("CropAuto", 1);
                 (void)mgpu::gpu1::ui_ini_write("ScaleMode", 1);
             }
         }
 
-        // ---- R351d: the blocks that only exist on titles with DLSS, frame generation, or x2 ----
+        // ---- R330: the blocks that only exist on titles with DLSS, frame generation, or x2 ----
         // The bridge is not an FC6 add-on. On a title with native DLSS these are the controls a
         // player actually touches, so they belong in the simple panel too - and every one of them is
         // marked for what it is: live, or "needs a restart".
@@ -610,30 +696,42 @@ namespace mgpu::psimple
 
         void row_sr_quality()
         {
-            // The panel writes SRScale and SRUpscale as a PAIR - SRScale=0 with the low-res flag on
-            // was rejected by NGX (FAIL_PlatformError), so the pair is written together here too.
-            const int sc = mgpu::gpu1::ui_ini_read("SRScale", 0);
-            const bool on = mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0;
-            const int cur = !on ? -1 : (sc == 67 ? 2 : (sc == 58 ? 1 : 0));
-            const char *names[3] = { "性能##srq", "均衡##srq", "质量##srq" };
-            const int scales[3] = { 50, 58, 67 };
-            for (int i = 0; i < 3; ++i)
+            // R330 (F5): the SAME writes as the full panel's DLSS box (dllmain, write_mode): SRQuality
+            // always; SRScale=0 + SRMvLowRes=0 when Native Upscaling is on (SRScale=0 in the ini), else
+            // SRScale 67/58/50 + SRMvLowRes=1. SRUpscale is not written here (that is sr.enable). Like the
+            // full panel, the choice is greyed while DLSS on GPU 1 is off or Native Upscaling is on.
+            const bool on    = mgpu::gpu1::ui_ini_read("SRUpscale", 0) != 0;
+            const bool match = mgpu::gpu1::ui_ini_read("SRScale", 0) == 0;
+            const int  mode  = mgpu::gpu1::ui_ini_read("SRQuality", 2);
+            const auto write_mode = [match](int m)
             {
-                if (i != 0) ImGui::SameLine();
-                if (ImGui::RadioButton(names[i], cur == i))
+                (void)mgpu::gpu1::ui_ini_write("SRQuality", m);
+                if (match)
                 {
-                    (void)mgpu::gpu1::ui_ini_write("SRUpscale", 1);
-                    (void)mgpu::gpu1::ui_ini_write("SRScale", scales[i]);
+                    (void)mgpu::gpu1::ui_ini_write("SRScale",    0);
+                    (void)mgpu::gpu1::ui_ini_write("SRMvLowRes", 0);
+                }
+                else
+                {
+                    const int scale = (m == 2) ? 67 : ((m == 1) ? 58 : 50);
+                    (void)mgpu::gpu1::ui_ini_write("SRScale",    scale);
                     (void)mgpu::gpu1::ui_ini_write("SRMvLowRes", 1);
                 }
-            }
+            };
+            ImGui::BeginDisabled(!on || match);
+            if (ImGui::RadioButton(L("ui.performance", "performance", "srq0").c_str(), mode == 0)) write_mode(0);
+            ImGui::SameLine();
+            if (ImGui::RadioButton(L("ui.balanced", "balanced", "srq1").c_str(), mode == 1)) write_mode(1);
+            ImGui::SameLine();
+            if (ImGui::RadioButton(L("ui.quality", "quality", "srq2").c_str(), mode == 2)) write_mode(2);
+            ImGui::EndDisabled();
             ImGui::SameLine();
         }
 
         void row_sr_preset()
         {
             const int pr = mgpu::gpu1::ui_ini_read("SRPreset", 0);
-            if (ImGui::RadioButton("标题默认##srp", pr == 0))       (void)mgpu::gpu1::ui_ini_write("SRPreset", 0);
+            if (ImGui::RadioButton(L("ui.title_default", "title default", "srp0").c_str(), pr == 0))       (void)mgpu::gpu1::ui_ini_write("SRPreset", 0);
             ImGui::SameLine();
             if (ImGui::RadioButton("K##srp", pr == 11))          (void)mgpu::gpu1::ui_ini_write("SRPreset", 11);
             ImGui::SameLine();
@@ -645,13 +743,13 @@ namespace mgpu::psimple
         void row_fg_mode()
         {
             const int fm = (int)mgpu::fgmap::ui_mode();
-            if (ImGui::RadioButton("关##fg", fm == 0))
+            if (ImGui::RadioButton(L("ui.off", "off", "fg0").c_str(), fm == 0))
             { mgpu::fgmap::ui_set_mode(0); (void)mgpu::gpu1::ui_ini_write("NRFrameFilter", 0); }
             ImGui::SameLine();
-            if (ImGui::RadioButton("修正向量##fg", fm == 2))
+            if (ImGui::RadioButton(L("ui.fg_fix", "fix vectors", "fg2").c_str(), fm == 2))
             { mgpu::fgmap::ui_set_mode(2); (void)mgpu::gpu1::ui_ini_write("NRFrameFilter", 2); }
             ImGui::SameLine();
-            if (ImGui::RadioButton("修正+抽帧##fg", fm == 3))
+            if (ImGui::RadioButton(L("ui.fg_fix_thin", "fix + thin", "fg3").c_str(), fm == 3))
             { mgpu::fgmap::ui_set_mode(3); (void)mgpu::gpu1::ui_ini_write("NRFrameFilter", 3); }
         }
 
@@ -664,7 +762,7 @@ namespace mgpu::psimple
             if (ImGui::IsItemDeactivatedAfterEdit())
                 (void)mgpu::gpu1::ui_ini_write("NRFrameKeep", (int)mgpu::fgmap::ui_keep());
             ImGui::SameLine();
-            ImGui::TextDisabled("每 N 帧保留 1 张");
+            ImGui::TextDisabled("%s", T("ui.fg_keep_hint", "keep 1 in N").c_str());
         }
 
         void row_x2_mode()
@@ -674,21 +772,21 @@ namespace mgpu::psimple
             const int rp = mgpu::gpu1::ui_ini_read("ResidualPass", 0);
             const int rr = mgpu::gpu1::ui_ini_read("ResidualRender", 0);
             const int cur = (rp == 0) ? 2 : (rr == 1 ? 1 : 0);   // 0 Medium, 1 Light, 2 Full
-            if (ImGui::RadioButton("中等##x2", cur == 0))
+            if (ImGui::RadioButton(L("ui.medium", "medium", "x2_0").c_str(), cur == 0))
             {
                 (void)mgpu::gpu1::ui_ini_write("ResidualPass", 2);
                 (void)mgpu::gpu1::ui_ini_write_float("ResidualScale", 0.75f);
                 (void)mgpu::gpu1::ui_ini_write("ResidualRender", 0);
             }
             ImGui::SameLine();
-            if (ImGui::RadioButton("轻量##x2", cur == 1))
+            if (ImGui::RadioButton(L("ui.light", "light", "x2_1").c_str(), cur == 1))
             {
                 (void)mgpu::gpu1::ui_ini_write("ResidualPass", 2);
                 (void)mgpu::gpu1::ui_ini_write_float("ResidualScale", 0.75f);
                 (void)mgpu::gpu1::ui_ini_write("ResidualRender", 1);
             }
             ImGui::SameLine();
-            if (ImGui::RadioButton("完整##x2", cur == 2))
+            if (ImGui::RadioButton(L("ui.full", "full", "x2_2").c_str(), cur == 2))
                 (void)mgpu::gpu1::ui_ini_write("ResidualPass", 0);
             ImGui::SameLine();
         }
@@ -717,7 +815,7 @@ namespace mgpu::psimple
             row("nrs.sharp",  "sharpness",      &row_nrs_sharp);
             row("nrs.colour", "colour strength",&row_nrs_colour);
             row("nrs.mode",   "mode",           &row_nrs_mode);
-            // R351g: nrs1.on is the author's "Pass 1 scale (NRS)" On/Off radio, nrs.scale is the live
+            // R330: nrs1.on is the author's "Pass 1 scale (NRS)" On/Off radio, nrs.scale is the live
             // slider under "Neural scale (our own path)". BOTH already exist in 0.4.0 and both write
             // NRScale, so they are one control: the simple panel exposes a single slider and accepts
             // either id in the layout file for it.
@@ -736,7 +834,7 @@ namespace mgpu::psimple
             row("fps.cap",         "fps cap",      &row_frame_cap);
             row("colour.16bit",    "16-bit colour",&row_colour16);
             row("crop",            "crop",         &row_crop);
-            // R351h: these seven were written but never registered, so the DLSS / frame-generation /
+            // R330: these seven were written but never registered, so the DLSS / frame-generation /
             // x2 sections came up empty. A row has to be BOTH drawn and registered.
             row("x2.mode",         "2nd pass (x2)",&row_x2_mode);
             row("sr.enable",       "DLSS on GPU 1",&row_sr_enable);
@@ -756,11 +854,35 @@ namespace mgpu::psimple
         ImGui::TextUnformatted(title_zh != nullptr ? title_zh : "MGPU - neural rendering");
         help("panel.title");
 
+        // R330: the full panel's install-layout warning, same words. A player in simple mode with
+        // nvngx_dlssnr.dll beside the exe is heading for the crash and must see it here too.
+        {
+            const int layout = mgpu::gpu1::ui_install_layout();
+            if (layout == 1)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.30f, 1.0f),
+                                   "INSTALL PROBLEM - the neural stage will crash this game.");
+                ImGui::TextUnformatted("nvngx_dlssnr.dll is next to the game's exe. The game loads it");
+                ImGui::TextUnformatted("there and claims the wrong GPU before this add-on starts.");
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "MOVE it into the mgpu folder next to the add-on, then restart.");
+                ImGui::Separator();
+            }
+            else if (layout == 2)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f),
+                                   "nvngx_dlssnr.dll not found - neural rendering cannot start.");
+                ImGui::TextUnformatted("Put it in the mgpu folder next to the add-on, then restart.");
+                ImGui::Separator();
+            }
+        }
+
         unsigned drawn = 0;
         for (const entry &e : g_layout)
         {
             if (e.id == "panel.title") continue;
-            // R351e: a banner in the file becomes a section title here. An empty banner is just a
+            if (e.id.compare(0, 3, "ui.") == 0) continue;   // R330 (F4): labels for controls, not rows
+            // R330: a banner in the file becomes a section title here. An empty banner is just a
             // separator, so '======' on its own is a rule and '==== 画质 ====' is a heading.
             if (e.header)
             {
@@ -785,20 +907,24 @@ namespace mgpu::psimple
             ImGui::TextDisabled("panel_simple.txt has no row this build can draw.");
 
         ImGui::Separator();
-        if (ImGui::Button("高级  >>"))
+        if (ImGui::Button(L("ui.advanced", "Advanced  >>", "advanced").c_str()))
             set_enabled(false);
         ImGui::SameLine();
-        if (ImGui::SmallButton("重新加载"))
+        if (ImGui::SmallButton(L("ui.reload", "reload", "reload").c_str()))
             reload();
     }
 
     void draw_editor()
     {
-        load_if_changed(false);
+        // R330 (F6): the checkbox is there for everyone; the rest only when panel_simple.txt is beside
+        // the add-on. Without the file nothing is read and nothing is logged.
         ImGui::SeparatorText("Simple panel");
-        bool on = mgpu::gpu1::ui_ini_read("PanelSimple", 0) != 0;
+        bool on = simple_flag() != 0;   // R330
         if (ImGui::Checkbox("PanelSimple - show the simple panel instead of this one", &on))
             set_enabled(on);
+        if (!file_present()) return;
+        load_if_changed(false);
+        register_rows();   // R330: the count below is right before the simple panel was ever drawn
         ImGui::SameLine();
         ImGui::TextDisabled("cjk font: %s | %d row(s) in panel_simple.txt, %d registered in this build",
                             cjk() ? "yes" : "NO (labels fall back to English)",
@@ -807,7 +933,7 @@ namespace mgpu::psimple
         ImGui::SameLine();
         if (ImGui::SmallButton("export items")) export_items();
         ImGui::SameLine();
-        if (ImGui::SmallButton("重新加载")) reload();
+        if (ImGui::SmallButton(L("ui.reload", "reload", "reload").c_str())) reload();
         ImGui::TextDisabled("A row appears in the simple panel only if panel_simple.txt names it, and"
                             " it must have a control in this build to be drawn.");
     }

@@ -7,10 +7,12 @@
 namespace mgpu::psimple
 {
     // Called once from DllMain: remembers the add-on's directory, where panel_simple.txt lives.
+    // R330 (F2): no file read and no log line here.
     void init(HMODULE mod);
 
     bool enabled();                  // PanelSimple=1 AND the layout file has at least one row
     void set_enabled(bool on);       // writes PanelSimple to mgpu.ini
+    void toggle();                   // R330 (F1): flips PanelSimple (own flag) and writes it; any thread, no layout access
     bool cjk();                      // the panel font ReShade loaded carries CJK glyphs
 
     void reload();                   // re-read panel_simple.txt now

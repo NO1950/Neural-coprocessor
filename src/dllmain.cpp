@@ -4107,7 +4107,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID lpReserved)
         // reshade_overlay event only when PanelOverPicture=1 (live_panel.cpp).
         mgpu::live_panel::attach(hModule);
         // The simple panel's layout file lives beside the add-on. init() only remembers the
-        // directory and reads panel_simple.txt; with PanelSimple unset nothing changes.
+        // directory (R330, F2: no file read here); panel_simple.txt is read on the first panel draw.
         mgpu::psimple::init(hModule);
         reshade::register_event<reshade::addon_event::destroy_swapchain>(on_destroy_swapchain);   // D1
         reshade::register_event<reshade::addon_event::set_fullscreen_state>(on_set_fullscreen_state);   // R241d observe / R242 refuse

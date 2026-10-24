@@ -64,3 +64,34 @@ fg.keep          | 生成帧窗口   | 修正+抽帧 时"每 N 帧保留 1 张"�
 fps.cap          | 帧率上限     | 0 = 不限制，30–240；同时限制游戏和 MGPU 生产端。【重启】
 colour.16bit     | 16 位色深    | 颜色用 16 位精度传输，画质更好、带宽更高。【重启】
 crop             | 裁切         | 只把画面中的一块送去神经卡，省带宽。【重启】
+
+# R330: control labels (buttons, choices). ui.<name> | 标签 . A missing line shows English.
+# 控件上的文字：ui.<名字> | 标签。删掉一行就显示英文。
+ui.default          | 默认
+ui.residual         | 残差
+ui.direct           | 直接
+ui.output           | 输出
+ui.input            | 输入
+ui.split            | 分屏
+ui.seam             | 分界
+ui.off              | 关
+ui.turn_off         | 关闭
+ui.on               | 开
+ui.auto             | 自动
+ui.synthetic        | 合成
+ui.real             | 真实
+ui.manual           | 手动
+ui.front            | 前置
+ui.back             | 后置
+ui.performance      | 性能
+ui.balanced         | 均衡
+ui.quality          | 质量
+ui.title_default    | 标题默认
+ui.fg_fix           | 修正向量
+ui.fg_fix_thin      | 修正+抽帧
+ui.fg_keep_hint     | 每 N 帧保留 1 张
+ui.medium           | 中等
+ui.light            | 轻量
+ui.full             | 完整
+ui.advanced         | 高级  >>
+ui.reload           | 重新加载

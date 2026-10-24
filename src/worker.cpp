@@ -791,11 +791,11 @@ namespace
                             const bool k_s = RegisterHotKey(nullptr, MGPU_HOTKEY_SIMPLE,
                                                 MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F4) != FALSE;
                             if (k_s)
-                                mgpu::diag::info("[MGPU][R351b] simple panel hotkey: CTRL+ALT+F4 switches the "
+                                mgpu::diag::info("[MGPU][R330] simple panel hotkey: CTRL+ALT+F4 switches the "
                                                  "panel between the full view and the simple one. It writes "
-                                                 "PanelSimple to mgpu.ini, so the choice survives a restart.");
+                                                 "PanelSimple to mgpu.ini, so the choice survives a restart.");   // R330
                             else
-                                mgpu::diag::warn("[MGPU][R351b] simple panel hotkey CTRL+ALT+F4 FAILED to "
+                                mgpu::diag::warn("[MGPU][R330] simple panel hotkey CTRL+ALT+F4 FAILED to "
                                                  "register - the checkbox in the full panel still switches it.");
                             if (mgpu::gpu1::dcomp_overlay_mode())
                             {
@@ -1053,6 +1053,7 @@ namespace
                 unsigned view_cycles = 0;
                 int seam_delta = 0;
                 int seam_coarse = 0;
+                unsigned simple_toggles = 0;   // R330: counted here, acted on after the drain
                 while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE) != FALSE)
                 {
                     if (m.message == WM_QUIT)
@@ -1070,10 +1071,13 @@ namespace
                     // the key is not registered there.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_PEEK)
                     { (void)mgpu::gpu1::dcomp_peek_toggle(); continue; }
-                    // The panel draws its next frame from the key, so this is immediate and
-                    // needs neither a restart nor the panel to be open.
+                    // The panel draws its next frame from the flag, so this is immediate and
+                    // needs neither a restart nor the panel to be open. R330 (F1): toggle() only
+                    // flips PanelSimple; the layout is never touched from this thread. Like
+                    // every other key here it is counted now and acted on once the queue is empty -
+                    // toggle() rewrites mgpu.ini, and a file rewrite does not belong inside the drain.
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SIMPLE)
-                    { mgpu::psimple::set_enabled(!mgpu::psimple::enabled()); continue; }
+                    { ++simple_toggles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_VIEW)
                     { ++view_cycles; continue; }
                     if (m.message == WM_HOTKEY && m.wParam == MGPU_HOTKEY_SEAM_L)
@@ -1104,6 +1108,8 @@ namespace
                 // step the thing they just selected.
                 for (unsigned c = 0; c < int_cycles; ++c)
                     mgpu::gpu1::intensity_cycle_target();
+                // R330: an odd number of presses in one drain is one flip; an even number is none.
+                if ((simple_toggles & 1u) != 0u) mgpu::psimple::toggle();
                 for (int d = 0; d < int_delta; ++d)  mgpu::gpu1::intensity_step(+1);
                 for (int d = 0; d > int_delta; --d)  mgpu::gpu1::intensity_step(-1);
 

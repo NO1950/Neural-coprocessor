@@ -14,13 +14,6 @@ project(mgpu_bridge CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# The simple panel's labels are Chinese, so the source must be read AND emitted as UTF-8;
-# without this MSVC takes the bytes in the system code page and the labels reach ImGui as
-# mojibake (ImGui expects UTF-8, which is what /utf-8 produces).
-if (MSVC)
-    add_compile_options(/utf-8)
-endif()
-
 # Source list follows the closed manifest (P0_RECORD.md, section 01):
 # T2 adds diag/adapter, T3 adds worker/gpu1_context. runtime_probe lands
 # with its own task; assets/ is deployed by hand and never compiled.
@@ -223,6 +216,11 @@ target_link_libraries(mgpu_bridge PRIVATE
 # P0: warnings visible, not fatal. A compile error costs the same round
 # trip as a logic error and teaches less - keep the first-try bar low.
 target_compile_options(mgpu_bridge PRIVATE /W3)
+# R330 (F7): panel_simple.cpp carries UTF-8 text, so it is read AND emitted as UTF-8 (ImGui expects
+# UTF-8). Only that file: every other source compiles exactly as before.
+if (MSVC)
+    set_source_files_properties(src/panel_simple.cpp PROPERTIES COMPILE_OPTIONS "/utf-8")
+endif()
 
 option(MGPU_BUILD_TESTS "Build CPU-only adapter policy tests" OFF)
 if(MGPU_BUILD_TESTS)
