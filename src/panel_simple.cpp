@@ -1,4 +1,4 @@
-﻿// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
+// MGPU Bridge - panel_simple: the one-click panel for people who just want to play.
 //
 // WHAT THIS IS. A second view of the SAME controls the full panel has, with the log lines, the
 // counters and the timing readouts stripped out, so a player who does not care about any of that can
@@ -808,6 +808,45 @@ namespace mgpu::psimple
             ImGui::TextDisabled("pass 1 at 0.75, detail added back at full size (restart)");
         }
 
+        // R377: the model-shaping controls of ONE pass. Same setters as the full
+        // panel; the full panel's controls are the "all passes" broadcast.
+        void nrs_tuning_n(unsigned pass_1based)
+        {
+            mgpu::gpu1::ui_state st;
+            mgpu::gpu1::ui_read(st);
+            const unsigned idx = (pass_1based >= 1u && pass_1based <= 4u) ? (pass_1based - 1u) : 0u;
+            ImGui::PushID((int)pass_1based);
+            float style = st.p_style[idx];
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::SliderFloat(L("ui.style", "style", "style").c_str(), &style, 0.0f, 2.0f, "%.2f"))
+                mgpu::gpu1::ui_set_pass_param(pass_1based, 0u, style);
+            if (ImGui::IsItemDeactivatedAfterEdit()) mgpu::gpu1::ui_persist_pass_param(pass_1based, 0u, style);
+            float tone = st.p_tone[idx];
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::SliderFloat(L("ui.tone", "tone", "tone").c_str(), &tone, 0.0f, 3.0f, "%.2f"))
+                mgpu::gpu1::ui_set_pass_param(pass_1based, 1u, tone);
+            if (ImGui::IsItemDeactivatedAfterEdit()) mgpu::gpu1::ui_persist_pass_param(pass_1based, 1u, tone);
+            float structure = st.p_structure[idx];
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::SliderFloat(L("ui.structure", "structure", "structure").c_str(), &structure, 0.0f, 3.0f, "%.2f"))
+                mgpu::gpu1::ui_set_pass_param(pass_1based, 2u, structure);
+            if (ImGui::IsItemDeactivatedAfterEdit()) mgpu::gpu1::ui_persist_pass_param(pass_1based, 2u, structure);
+            float skin = st.p_skin[idx];
+            ImGui::SetNextItemWidth(150.0f);
+            if (ImGui::SliderFloat(L("ui.skin", "skin", "skin").c_str(), &skin, 0.0f, 3.0f, "%.2f"))
+                mgpu::gpu1::ui_set_pass_param(pass_1based, 3u, skin);
+            if (ImGui::IsItemDeactivatedAfterEdit()) mgpu::gpu1::ui_persist_pass_param(pass_1based, 3u, skin);
+            bool mask = st.p_automask[idx];
+            if (ImGui::Checkbox(L("ui.mask", "auto mask", "mask").c_str(), &mask))
+            {
+                mgpu::gpu1::ui_set_pass_param(pass_1based, 4u, mask ? 1.0f : 0.0f);
+                mgpu::gpu1::ui_persist_pass_param(pass_1based, 4u, mask ? 1.0f : 0.0f);
+            }
+            ImGui::PopID();
+        }
+        void row_tune1() { nrs_tuning_n(1u); }
+        void row_tune2() { nrs_tuning_n(2u); }
+
         void register_rows()
         {
             row("nrs.scale",  "NRScale",        &row_nrs_scale);
@@ -822,6 +861,8 @@ namespace mgpu::psimple
             row("nrs1.on",    "pass 1 scale",   &row_nrs_scale);
             row("passes",     "passes",         &row_passes);
             row("intensity",  "intensity",      &row_intensity);
+            row("tune1",      "pass 1 look",    &row_tune1);
+            row("tune2",      "pass 2 look",    &row_tune2);
             row("intensity.preset", "intensity curve", &row_preset);
             row("view",       "view",           &row_view);
             row("neural",     "neural stage",   &row_neural);

@@ -9937,6 +9937,13 @@ namespace
         // over-long list is a compile error, which is the intended behaviour:
         // it forces this line to be revisited whenever the bound moves.
         float intensity[MAX_PASSES] = { 0.84f, 0.84f };
+        // R377: the model-shaping knobs per pass. They start at the global values
+        // read below, so a run that never touches them is identical to 0.4.0.
+        float p_style[MAX_PASSES] = {};
+        float p_tone[MAX_PASSES] = {};
+        float p_structure[MAX_PASSES] = {};
+        float p_skin[MAX_PASSES] = {};
+        bool p_automask[MAX_PASSES] = {};
 
         // ---- P8.0: DLSSNR.MVec - the half of the model's contract that has
         // never been fed ----
@@ -14311,6 +14318,50 @@ namespace
         s.skin_strength      = ini_read_float("SkinStrength",      1.0f);
         s.style              = ini_read_float("Style",             0.0f);
         s.auto_mask          = ini_read_flag("AutoMask");
+        // R377: every pass starts on the global values. This is what makes the
+        // feature invisible until somebody moves a per-pass control.
+        for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+        {
+            s.p_style[i]     = s.style;
+            s.p_tone[i]      = s.tone_strength;
+            s.p_structure[i] = s.structure_strength;
+            s.p_skin[i]      = s.skin_strength;
+            s.p_automask[i]  = s.auto_mask;
+        }
+        // R377: per-pass look overrides. Read HERE, after the global values and
+        // the per-pass seed, because this is the only place where both exist.
+        // (Reading them in stream_request would be overwritten by the seed above.)
+        {
+            unsigned named = 0u;
+            for (unsigned i = 0; i < s.passes && i < stream_state::MAX_PASSES; ++i)
+            {
+                char key[40];
+                const unsigned p = i + 1u;
+                snprintf(key, sizeof key, "Pass%uStyle", p);
+                if (ini_has_key(key)) { s.p_style[i] = ini_read_float(key, s.p_style[i]); ++named; }
+                snprintf(key, sizeof key, "Pass%uTone", p);
+                if (ini_has_key(key)) { s.p_tone[i] = ini_read_float(key, s.p_tone[i]); ++named; }
+                snprintf(key, sizeof key, "Pass%uStructure", p);
+                if (ini_has_key(key)) { s.p_structure[i] = ini_read_float(key, s.p_structure[i]); ++named; }
+                snprintf(key, sizeof key, "Pass%uSkin", p);
+                if (ini_has_key(key)) { s.p_skin[i] = ini_read_float(key, s.p_skin[i]); ++named; }
+                snprintf(key, sizeof key, "Pass%uAutoMask", p);
+                if (ini_has_key(key)) { s.p_automask[i] = ini_read_flag(key); ++named; }
+            }
+            if (named != 0u)
+            {
+                // A PassN key is itself a request to apply the group; without
+                // this the arm would read the value and never set it.
+                s.tuning_on = true;
+                char pl[320];
+                snprintf(pl, sizeof pl,
+                         "[MGPU][R377] per-pass look: %u key(s) named; p1 style=%.2f tone=%.2f "
+                         "structure=%.2f skin=%.2f mask=%u",
+                         named, (double)s.p_style[0], (double)s.p_tone[0], (double)s.p_structure[0],
+                         (double)s.p_skin[0], s.p_automask[0] ? 1u : 0u);
+                mgpu::diag::info(pl);
+            }
+        }
 
         // R214: pass 1 foveated. Off unless Pass1Fovea=alt or =window.
         {
@@ -18515,6 +18566,17 @@ void ui_read(ui_state &out)
     out.preset       = s.preset;
     out.split_pos    = s.split_pos;
     for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i) out.intensity[i] = s.intensity[i];
+    static_assert(sizeof(ui_state::p_style) / sizeof(float) >= stream_state::MAX_PASSES,
+                  "ui_state::p_style is smaller than MAX_PASSES - update gpu1_context.hpp");
+    for (unsigned i = 0; i < 4u; ++i)
+    {
+        const unsigned k = (i < stream_state::MAX_PASSES) ? i : (stream_state::MAX_PASSES - 1u);
+        out.p_style[i] = s.p_style[k];
+        out.p_tone[i] = s.p_tone[k];
+        out.p_structure[i] = s.p_structure[k];
+        out.p_skin[i] = s.p_skin[k];
+        out.p_automask[i] = s.p_automask[k];
+    }
     out.consumed    = s.consumed;
     out.produced    = s.produced;
     out.dropped     = s.dropped;
@@ -18803,6 +18865,20 @@ void ui_set_tuning_value(int which, float v)
     case 4: s.auto_mask = (v != 0.0f); break;
     default: return;
     }
+    // R377: the full panel's controls are the "all passes" control. Broadcast
+    // them so a run that only uses the full panel keeps behaving as before.
+    for (unsigned i = 0; i < stream_state::MAX_PASSES; ++i)
+    {
+        switch (which)
+        {
+        case 0: s.p_tone[i]      = v; break;
+        case 1: s.p_structure[i] = v; break;
+        case 2: s.p_skin[i]      = v; break;
+        case 3: s.p_style[i]     = v; break;
+        case 4: s.p_automask[i]  = (v != 0.0f); break;
+        default: break;
+        }
+    }
     // First touch enables the group. The panel shows these controls whether or
     // not tuning is on, because they are the first thing to reach for when the
     // image looks wrong - but nothing is SET until someone moves one, so a run
@@ -18822,6 +18898,51 @@ void ui_set_tuning_value(int which, float v)
         else if (which == 4) (void)ui_ini_write("AutoMask", (v != 0.0f) ? 1 : 0);
         (void)ui_ini_write("Tuning", 1);
     }
+}
+
+// R377: one setter for the per-pass look parameters.
+// knob: 0 style, 1 tone, 2 structure, 3 skin, 4 auto-mask.
+void ui_set_pass_param(unsigned pass_1based, unsigned knob, float v)
+{
+    if (pass_1based < 1u) pass_1based = 1u;
+    if (pass_1based > stream_state::MAX_PASSES) pass_1based = stream_state::MAX_PASSES;
+    stream_state &s = str();
+    std::lock_guard<std::mutex> lk(s.cs);
+    const unsigned i = pass_1based - 1u;
+    switch (knob)
+    {
+    case 0: s.p_style[i]     = v; break;
+    case 1: s.p_tone[i]      = v; break;
+    case 2: s.p_structure[i] = v; break;
+    case 3: s.p_skin[i]      = v; break;
+    case 4: s.p_automask[i]  = (v != 0.0f); break;
+    default: return;
+    }
+    s.tuning_on = true;   // first touch enables the group, as the full panel does
+    ++s.intensity_edits;
+}
+
+// R377 (PanelPersist=1 only). Called when a slider is released; writes the one
+// key and Tuning=1 (without Tuning the next arm would read the value and ignore
+// it). Same rule as ui_persist_intensity: no lock held here.
+void ui_persist_pass_param(unsigned pass_1based, unsigned knob, float v)
+{
+    if (!mgpu::t119::panel_persist()) return;
+    if (pass_1based < 1u) pass_1based = 1u;
+    if (pass_1based > stream_state::MAX_PASSES) pass_1based = stream_state::MAX_PASSES;
+    char key[40];
+    switch (knob)
+    {
+    case 0: snprintf(key, sizeof key, "Pass%uStyle",     pass_1based); break;
+    case 1: snprintf(key, sizeof key, "Pass%uTone",      pass_1based); break;
+    case 2: snprintf(key, sizeof key, "Pass%uStructure", pass_1based); break;
+    case 3: snprintf(key, sizeof key, "Pass%uSkin",      pass_1based); break;
+    case 4: snprintf(key, sizeof key, "Pass%uAutoMask",  pass_1based); break;
+    default: return;
+    }
+    if (knob == 4u) (void)ui_ini_write(key, (v != 0.0f) ? 1 : 0);
+    else            (void)ui_ini_write_float(key, v);
+    (void)ui_ini_write("Tuning", 1);
 }
 
 // P8.0. Live from the panel. Nothing is created or destroyed - the texture
@@ -25622,11 +25743,30 @@ void stream_poll()
                     // overrides a slider, keeping the escape hatch on top.
                     if (s.tuning_on)
                     {
-                        s.nr_params->Set("DLSSNR.LocalToneStrength",      s.tone_strength);
-                        s.nr_params->Set("DLSSNR.LocalStructureStrength", s.structure_strength);
-                        s.nr_params->Set("DLSSNR.SkinStructureStrength",  s.skin_strength);
-                        s.nr_params->Set("DLSSNR.Style",                  s.style);
-                        s.nr_params->Set("DLSSNR.UseAutoMask", s.auto_mask ? 1u : 0u);
+                        const unsigned pk = (pi < stream_state::MAX_PASSES) ? pi : (stream_state::MAX_PASSES - 1u);
+                        s.nr_params->Set("DLSSNR.LocalToneStrength",      s.p_tone[pk]);
+                        s.nr_params->Set("DLSSNR.LocalStructureStrength", s.p_structure[pk]);
+                        s.nr_params->Set("DLSSNR.SkinStructureStrength",  s.p_skin[pk]);
+                        s.nr_params->Set("DLSSNR.Style",                  s.p_style[pk]);
+                        s.nr_params->Set("DLSSNR.UseAutoMask", s.p_automask[pk] ? 1u : 0u);
+                        // R377: first frames only - what this pass actually handed NGX.
+                        // A per-pass control that never reaches the feature looks exactly
+                        // like a control with no visible effect; this line separates them.
+                        {
+                            static unsigned r377_n = 0u;
+                            if (r377_n < 16u)
+                            {
+                                ++r377_n;
+                                char rl[240];
+                                snprintf(rl, sizeof rl,
+                                         "[MGPU][R377] EVAL pass=%u style=%.2f tone=%.2f "
+                                         "structure=%.2f skin=%.2f mask=%u",
+                                         pi + 1u, (double)s.p_style[pk], (double)s.p_tone[pk],
+                                         (double)s.p_structure[pk], (double)s.p_skin[pk],
+                                         s.p_automask[pk] ? 1u : 0u);
+                                mgpu::diag::info(rl);
+                            }
+                        }
                     }
                     // P6.2: whatever the ini named, verbatim, before every
                     // evaluate. Applied AFTER Intensity so a Set.DLSSNR.Intensity

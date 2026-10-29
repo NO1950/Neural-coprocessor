@@ -483,6 +483,11 @@ struct ui_state
     // copy rather than error.
     unsigned passes = 1, max_passes = 2;
     float intensity[2] = {};
+    // R377: the same model-shaping controls, per pass. Index 0 is pass 1. The
+    // arrays are 4 wide so a future MAX_PASSES change is a compile error here
+    // (static_assert in ui_read) rather than a silently truncated copy.
+    float p_style[4] = {}, p_tone[4] = {}, p_structure[4] = {}, p_skin[4] = {};
+    bool p_automask[4] = {};
     // P7.9: the guide's tuning parameters. tuning_on false = none of them are
     // set, which is what every published measurement ran under.
     bool  tuning_on = false, auto_mask = false;
@@ -638,6 +643,13 @@ void ui_set_intensity(unsigned pass_1based, float v);
 // R300n: PanelPersist=1 only - writes the value to mgpu.ini once (the panel calls it when the
 // slider is released), with no lock held. No-op without PanelPersist=1.
 void ui_persist_intensity(unsigned pass_1based, float v);
+
+// R377: one setter for the per-pass look parameters.
+// knob: 0 style, 1 tone, 2 structure, 3 skin, 4 auto-mask.
+void ui_set_pass_param(unsigned pass_1based, unsigned knob, float v);
+// R377: PanelPersist=1 only - writes that one knob to mgpu.ini when the slider
+// is released. No-op without PanelPersist=1.
+void ui_persist_pass_param(unsigned pass_1based, unsigned knob, float v);
 
 // P7.9. The DLSS-NR tuning parameters, names and types taken from the feature's
 // programming guide rather than guessed:

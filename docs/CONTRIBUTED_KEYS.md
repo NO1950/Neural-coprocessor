@@ -51,6 +51,7 @@ the bridge thread spun on a frame that had already arrived. No new key: it is pa
 | `NRScaleCap` | default `1.00` | How far the panel's scale slider may go | With `NRScale` |
 | `NRScaleX`, `NRScaleY`, `NRSharpness`, `NRDetailGain`, `NRMode`, `NRColorStrength` | | Tuning of the `NRScale` path. Read only when the `NRScale` line is present | With `NRScale` |
 | `NRProbe` | `1` | Measures the neural effect in the log (R299c). Works with or without `NRScale` | No |
+| `Pass1Style`, `Pass1Tone`, `Pass1Structure`, `Pass1Skin`, `Pass1AutoMask` | | Per-pass look overrides for pass 1; `Pass2...` for pass 2. Missing = the global `Style` / `ToneStrength` / `StructureStrength` / `SkinStrength` / `AutoMask` value, so an ini without them behaves exactly as 0.4.0. The simple panel's "pass N look" block writes these keys when `PanelPersist=1` | Yes, only when the value differs from the global one |
 | `NRSetAtCreate` | `1` | Applies the `Set.*` lines of `mgpu.ini` to DLSS-NR before its CreateFeature as well as at each evaluate (P6.2c), for keys that size the network. Does nothing without `Set.*` lines. Separate from `NRScale` | Only through the `Set.*` keys |
 | `PanelSimple` | `1` | Shows the simple panel (Chinese labels, layout in `panel_simple.txt` beside the add-on) instead of the full panel. CTRL+ALT+F4 flips this key in game. Without `panel_simple.txt` the simple panel shows nothing and the full panel stays (R330) | Panel only |
 
